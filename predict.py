@@ -1,0 +1,944 @@
+# ============================================================
+# predict.py  —  Run prediction on a single audio file and
+#                generate visualisation plots for the UI
+#
+# CHANGES vs previous version (all marked # CHANGED):
+#   Task 1  — load_adaptive_threshold()   : loads threshold.pkl from training
+#   Task 3  — load_feature_importances()  : loads feature_importances_.pkl
+#   Task 2  — compute_weighted_zscore_vote(): z-score vote with importance weights
+#   Task 6  — compute_ensemble_status()   : 3-detector voting (RF+baseline+zscore)
+#   Task 7  — predict_engine_status()     : three-zone PASS/WARNING/FAIL
+#   Task 7  — format_result_text()        : shows WARNING zone and threshold
+# ============================================================
+
+import os
+import numpy as np
+import joblib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import librosa
+import librosa.display
+
+from feature_extraction import (
+    extract_features, load_audio,
+    get_spectrogram_data, get_mel_spectrogram_data,
+    extract_mfcc_features
+)
+from train_model import load_model
+from config import (
+    SAMPLE_RATE, HOP_LENGTH, N_FFT,
+    BASELINE_PATH, BASELINE_WARN_SIGMA, BASELINE_FAIL_SIGMA,
+    PASS_THRESHOLD, WARN_THRESHOLD,                    # CHANGED — three-zone thresholds
+    ENSEMBLE_FAIL_VOTES,                               # CHANGED — ensemble voting
+    WEIGHT_MFCC, WEIGHT_SPECTRAL, WEIGHT_OTHER         # CHANGED — feature weights
+)
+
+
+# ────────────────────────────────────────────────────────────
+# COLOUR PALETTE  (consistent across all plots)
+# ────────────────────────────────────────────────────────────
+PASS_COLOR = "#2ECC71"    # green
+FAIL_COLOR = "#E74C3C"    # red
+WARN_COLOR = "#F39C12"    # orange
+WAVE_COLOR = "#3498DB"    # blue
+BG_COLOR   = "#1A1A2E"    # dark navy
+GRID_COLOR = "#2C2C54"
+TEXT_COLOR = "#ECF0F1"
+
+# ── Paths for new artefacts saved by train_model.py ──────────
+THRESHOLD_PATH   = "models/threshold.pkl"              # CHANGED
+IMPORTANCES_PATH = "models/feature_importances.pkl"    # CHANGED
+
+
+# ────────────────────────────────────────────────────────────
+# NEW HELPERS  (Task 1, 2, 3, 6)
+# ────────────────────────────────────────────────────────────
+
+def load_adaptive_threshold():
+    """
+    CHANGED (Task 1) — Load the adaptive PASS threshold that was computed
+    from the training data by train_model.py.
+
+    Falls back to config.PASS_THRESHOLD if threshold.pkl does not exist
+    (e.g. model was trained before this update).
+
+    Returns
+    -------
+    pass_threshold : float   Normal Score >= this -> PASS
+    warn_threshold : float   Normal Score >= this -> WARNING (below -> FAIL)
+    source         : str     "adaptive" or "config_default"
+    """
+    if os.path.exists(THRESHOLD_PATH):
+        data           = joblib.load(THRESHOLD_PATH)
+        pass_thr       = float(data["threshold"])
+        # WARNING zone starts at 70% of the PASS threshold
+        warn_thr       = pass_thr * 0.70               # CHANGED — dynamic WARN zone
+        return pass_thr, warn_thr, "adaptive"
+    # Fallback to config defaults
+    return PASS_THRESHOLD, WARN_THRESHOLD, "config_default"
+
+
+def load_feature_importances():
+    """
+    CHANGED (Task 3) — Load RF feature importances saved by train_model.py.
+
+    Returns None if the file does not exist (graceful degradation:
+    all features get equal weight in that case).
+    """
+    if os.path.exists(IMPORTANCES_PATH):
+        return joblib.load(IMPORTANCES_PATH)   # np.ndarray shape (226,)
+    return None
+
+
+def compute_weighted_zscore_vote(file_path, importances=None):
+    """
+    CHANGED (Task 2 & 3) — Z-score based vote using feature importance weights.
+
+    For each of the 226 features, compute how many standard deviations
+    the current engine is from the training-mean (stored in the scaler).
+    Then compute a weighted anomaly score:
+        - MFCC features  get weight WEIGHT_MFCC   (50%)
+        - Spectral/RMS   get weight WEIGHT_SPECTRAL (30%)
+        - Chroma/ZCR/Mel get weight WEIGHT_OTHER    (20%)
+    Further, if feature_importances are available, multiply each feature's
+    z-score by its importance so that low-importance noisy features cannot
+    alone trigger a false alarm.
+
+    Returns
+    -------
+    vote      : str     "PASS" / "WARNING" / "FAIL"
+    score     : float   Weighted anomaly score (higher = more abnormal)
+    """
+    try:
+        model, scaler = load_model()
+        features      = extract_features(file_path)          # (226,)
+
+        # Z-score = how many std from the scaler's training mean
+        # scaler.mean_ and scaler.scale_ were learned on the training data
+        z_scores = (features - scaler.mean_) / (scaler.scale_ + 1e-9)  # (226,)
+
+        # ── Build feature group weight vector ─────────────────
+        n = len(z_scores)
+        weights = np.ones(n, dtype=np.float32)
+
+        # Feature layout: [0:80]=MFCC, [80:84]=spectral, [84:96]=chroma,
+        #                  [96:98]=rms, [98:226]=mel
+        weights[0:80]   *= WEIGHT_MFCC      # MFCC mean+std (Task 3 weight)
+        weights[80:84]  *= WEIGHT_SPECTRAL  # spectral features
+        weights[84:96]  *= WEIGHT_OTHER     # chroma
+        weights[96:98]  *= WEIGHT_SPECTRAL  # RMS
+        weights[98:226] *= WEIGHT_OTHER     # mel mean (128 bands)
+
+        # ── Apply feature importances if available ─────────────
+        if importances is not None and len(importances) == n:
+            # Normalize importances to mean=1 so they act as multipliers
+            norm_imp = importances / (importances.mean() + 1e-9)
+            weights  = weights * norm_imp                    # CHANGED — importance weighting
+
+        # ── Weighted anomaly score ─────────────────────────────
+        # Use absolute z-scores: large positive OR negative deviation = anomaly
+        abs_z         = np.abs(z_scores)
+        weighted_score = float(np.sum(abs_z * weights) / (np.sum(weights) + 1e-9))
+
+        # ── Vote thresholds ────────────────────────────────────
+        # These are empirically chosen: a well-normalized healthy engine
+        # should have a weighted z-score below 1.5
+        if weighted_score < 1.5:
+            vote = "PASS"
+        elif weighted_score < 2.5:
+            vote = "WARNING"
+        else:
+            vote = "FAIL"
+
+        return vote, weighted_score
+
+    except Exception:
+        return "PASS", 0.0              # if anything fails, don't penalise
+
+
+def compute_ensemble_status(prob_normal, baseline_risk_level, zscore_vote):
+    """
+    CHANGED (Task 6 & 10) — Ensemble voting from 3 independent detectors.
+
+    Detectors
+    ---------
+    1. RF model      : PASS / WARNING / FAIL  (from prob_normal + adaptive threshold)
+    2. Baseline sigma: OK -> PASS, WARNING -> WARNING, ALERT -> FAIL
+    3. Z-score       : PASS / WARNING / FAIL  (from compute_weighted_zscore_vote)
+
+    Voting rule (Task 6 Confidence Rule):
+        - Count how many detectors vote FAIL
+        - Count how many detectors vote WARNING or worse
+        - FAIL only if fail_votes >= ENSEMBLE_FAIL_VOTES  (default 2)
+        - WARNING if any single detector says WARNING/FAIL but not enough for FAIL
+        - PASS if all detectors say PASS
+
+    This directly prevents a single uncertain detector from causing a
+    false positive — at least 2 out of 3 must agree before engine is FAIL.
+
+    Returns
+    -------
+    final_status   : str    "PASS" / "WARNING" / "FAIL"
+    explanation    : str    Brief reason for the decision
+    """
+    pass_thr, warn_thr, _ = load_adaptive_threshold()
+
+    # ── Detector 1: RF model ───────────────────────────────────
+    if prob_normal >= pass_thr:
+        rf_vote = "PASS"
+    elif prob_normal >= warn_thr:
+        rf_vote = "WARNING"
+    else:
+        rf_vote = "FAIL"
+
+    # ── Detector 2: Baseline sigma ─────────────────────────────
+    baseline_map = {"OK": "PASS", "WARNING": "WARNING", "ALERT": "FAIL",
+                    "N/A": "PASS"}
+    baseline_vote = baseline_map.get(baseline_risk_level, "PASS")
+
+    # ── Detector 3: Z-score vote (already computed) ────────────
+    zscore_v = zscore_vote   # "PASS" / "WARNING" / "FAIL"
+
+    votes = [rf_vote, baseline_vote, zscore_v]
+    fail_count    = votes.count("FAIL")
+    warn_or_worse = fail_count + votes.count("WARNING")
+
+    if fail_count >= ENSEMBLE_FAIL_VOTES:          # >= 2 detectors say FAIL
+        final_status = "FAIL"
+        explanation  = (f"[RF={rf_vote}, Baseline={baseline_vote}, "
+                        f"ZScore={zscore_v}] — {fail_count}/3 FAIL votes")
+    elif warn_or_worse >= ENSEMBLE_FAIL_VOTES:     # >= 2 say WARNING or worse
+        final_status = "WARNING"
+        explanation  = (f"[RF={rf_vote}, Baseline={baseline_vote}, "
+                        f"ZScore={zscore_v}] — {warn_or_worse}/3 WARNING+ votes")
+    else:                                          # most detectors say PASS
+        final_status = "PASS"
+        explanation  = (f"[RF={rf_vote}, Baseline={baseline_vote}, "
+                        f"ZScore={zscore_v}] — majority PASS")
+
+    return final_status, explanation
+
+
+# ────────────────────────────────────────────────────────────
+# 1.  CORE PREDICTION  (Random Forest + adaptive threshold)
+# ────────────────────────────────────────────────────────────
+def predict_engine_status(file_path):
+    """
+    Load the trained model, extract features, apply adaptive threshold,
+    and return PASS / WARNING / FAIL with probabilities.
+
+    CHANGED (Task 1 & 7):
+    - Loads adaptive threshold from models/threshold.pkl (falls back to config)
+    - Uses THREE zones: PASS / WARNING / FAIL instead of binary PASS/FAIL
+    - PASS  = Normal Score >= pass_threshold  (adaptive, ~95th pct of training normals)
+    - WARNING = Normal Score >= warn_threshold (70% of pass_threshold)
+    - FAIL  = Normal Score <  warn_threshold
+
+    Returns
+    -------
+    status        : str    "PASS" / "WARNING" / "FAIL"
+    confidence    : float  Confidence % (0–100)
+    prediction    : int    0=Normal, 1=Abnormal  (raw model vote, unchanged)
+    prob_normal   : float  Probability of being normal (0–1)
+    prob_abnormal : float  Probability of being abnormal (0–1)
+    pass_threshold: float  The threshold used (for display in report)
+    """
+    model, scaler = load_model()
+
+    features        = extract_features(file_path)
+    features_scaled = scaler.transform(features.reshape(1, -1))
+
+    prediction    = model.predict(features_scaled)[0]
+    probabilities = model.predict_proba(features_scaled)[0]
+
+    prob_normal   = probabilities[0]
+    prob_abnormal = probabilities[1]
+
+    # CHANGED — load adaptive threshold from training data
+    pass_thr, warn_thr, thr_source = load_adaptive_threshold()
+
+    # CHANGED — three-zone decision
+    if prob_normal >= pass_thr:
+        status = "PASS"
+    elif prob_normal >= warn_thr:
+        status = "WARNING"                             # CHANGED — new WARNING zone
+    else:
+        status = "FAIL"
+
+    # Confidence = certainty of the actual status
+    if status == "PASS":
+        confidence = prob_normal * 100
+    elif status == "FAIL":
+        confidence = prob_abnormal * 100
+    else:                                              # WARNING
+        # How far are we into the warning zone?  0% = bottom, 100% = near pass
+        zone_width  = max(pass_thr - warn_thr, 1e-9)
+        confidence  = ((prob_normal - warn_thr) / zone_width) * 100
+        confidence  = float(np.clip(confidence, 0, 100))
+
+    return status, confidence, prediction, prob_normal, prob_abnormal, pass_thr
+
+
+# ────────────────────────────────────────────────────────────
+# 2.  BASELINE COMPARISON  (uses acoustic_baseline.py)
+# ────────────────────────────────────────────────────────────
+
+def load_baseline():
+    """Load baseline dict from models/baseline.pkl."""
+    if not os.path.exists(BASELINE_PATH):
+        raise FileNotFoundError(
+            f"Baseline not found at '{BASELINE_PATH}'.\n"
+            "Build it first using the Baseline Builder tab in the app,\n"
+            "or run: python acoustic_baseline.py"
+        )
+    return joblib.load(BASELINE_PATH)
+
+# ────────────────────────────────────────────────────────────
+# 3.  PLOT: WORM GRAPH  (cricket-style cumulative energy chart)
+# ────────────────────────────────────────────────────────────
+
+def plot_worm_graph(file_path):
+    """
+    Cricket-style worm graph that compares cumulative mel-band energy
+    of the Healthy Baseline vs the Current Engine recording.
+
+    Concept (mirrors the cricket worm chart in the screenshot):
+    ──────────────────────────────────────────────────────────
+    X axis : Mel frequency band index  0 → N_MELS-1   (like "overs")
+    Y axis : Cumulative energy (scaled 0–300)          (like "total runs")
+
+    Lines
+    ─────
+    Blue  + circle markers  =  Healthy Baseline (Good Engine)
+    Grey  + square markers  =  Current Engine
+    Red filled circles      =  Anomaly bands (current deviates from baseline)
+    Red vertical shading    =  Region of anomaly
+
+    Parameters
+    ----------
+    file_path : str   Path to the current engine audio file.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure  or  None if baseline has no mel data.
+    """
+    # ── Inline imports to avoid circular deps ────────────────
+    from acoustic_baseline import (
+        load_audio_for_baseline, normalize_audio
+    )
+
+    # ── Load baseline mel data ────────────────────────────────
+    baseline     = load_baseline()
+    baseline_mel = baseline.get("avg_mel_per_band", None)
+
+    # ── CHANGED: Load current engine audio FIRST ─────────────
+    # We need the audio regardless of whether baseline_mel exists,
+    # so we load it here and use it as fallback if baseline has no mel data.
+    audio, sr = load_audio_for_baseline(file_path)
+    if audio is None:
+        return None                              # genuine load error — give up
+    audio = normalize_audio(audio)
+
+    from config import N_MELS as _N_MELS         # CHANGED: local import for N_MELS
+    n_bands = _N_MELS                            # = 128
+
+    # Compute current engine per-band mel energy (always needed)
+    mel = librosa.feature.melspectrogram(
+        y=audio, sr=sr,
+        n_mels=n_bands, n_fft=N_FFT, hop_length=HOP_LENGTH
+    )
+    mel_db      = librosa.power_to_db(mel, ref=np.max)
+    current_mel = np.mean(mel_db, axis=1)        # (128,) mean energy per mel band
+
+    # ── CHANGED: Fallback when baseline has no mel data ───────
+    # Old baseline.pkl (built before avg_mel_per_band was added) will have
+    # None here. Instead of returning None (blank plot), we fall back to
+    # using the current file itself as the "baseline" so the graph renders
+    # and the user sees at least the current engine curve.
+    if baseline_mel is None or np.all(baseline_mel == 0):
+        baseline_mel = current_mel.copy()        # CHANGED: fallback, not return None
+
+    # ── Build cumulative worm curves ─────────────────────────
+    #   Shift both series so the minimum is 0 (dB values can be negative).
+    #   Then cumulative sum → always increasing curve like cricket scoring.
+    offset          = min(baseline_mel.min(), current_mel.min())
+    baseline_shifted = baseline_mel - offset   # all ≥ 0
+    current_shifted  = current_mel  - offset   # all ≥ 0
+
+    baseline_cumsum = np.cumsum(baseline_shifted)   # (128,)
+    current_cumsum  = np.cumsum(current_shifted)    # (128,)
+
+    # Scale both curves so the baseline tops out at 300 (like cricket score)
+    scale_factor    = 300.0 / (baseline_cumsum[-1] + 1e-9)
+    baseline_worm   = baseline_cumsum * scale_factor
+    current_worm    = current_cumsum  * scale_factor
+
+    # ── Detect anomaly bands ──────────────────────────────────
+    #   Anomaly = bands where raw per-band diff > mean + 2*std
+    per_band_diff   = np.abs(current_mel - baseline_mel)
+    diff_thresh     = np.mean(per_band_diff) + 2.0 * np.std(per_band_diff)
+    anomaly_bands   = np.where(per_band_diff > diff_thresh)[0]   # indices
+
+    # ── Marker positions (every N_MELS/20 bands, like cricket overs) ─────
+    step     = max(1, n_bands // 20)
+    mark_x   = np.arange(0, n_bands, step)
+
+    # ── Figure ────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+
+    # Red vertical shading at every anomaly band
+    for band in anomaly_bands:
+        ax.axvspan(band - 0.5, band + 0.5, color=FAIL_COLOR, alpha=0.18, zorder=1)
+
+    # ── Healthy baseline line (blue + circles) ────────────────
+    ax.plot(
+        np.arange(n_bands), baseline_worm,
+        color="#3498DB", linewidth=2.2, alpha=0.95,
+        label="Good Engine (Baseline)", zorder=3
+    )
+    ax.plot(
+        mark_x, baseline_worm[mark_x],
+        "o", color="#3498DB", markersize=7,
+        markerfacecolor="#3498DB", markeredgecolor=BG_COLOR,
+        markeredgewidth=1.2, zorder=4
+    )
+
+    # ── Current engine line (grey + squares) ─────────────────
+    ax.plot(
+        np.arange(n_bands), current_worm,
+        color="#95A5A6", linewidth=2.2, alpha=0.95,
+        label="Current Engine", zorder=3
+    )
+    ax.plot(
+        mark_x, current_worm[mark_x],
+        "s", color="#95A5A6", markersize=7,
+        markerfacecolor="#95A5A6", markeredgecolor=BG_COLOR,
+        markeredgewidth=1.2, zorder=4
+    )
+
+    # ── Red anomaly markers on the current engine line ────────
+    if len(anomaly_bands) > 0:
+        ax.plot(
+            anomaly_bands, current_worm[anomaly_bands],
+            "o", color=FAIL_COLOR, markersize=11, zorder=5,
+            label=f"Anomaly Band ({len(anomaly_bands)})",  # CHANGED: removed emoji from label
+            markerfacecolor=FAIL_COLOR, markeredgecolor="#FFD0D0",
+            markeredgewidth=1.5
+        )
+
+    # ── Horizontal reference lines ────────────────────────────
+    for y_val in [50, 100, 150, 200, 250, 300]:
+        ax.axhline(y_val, color=GRID_COLOR, linewidth=0.5, alpha=0.5, zorder=0)
+
+    # ── Labels and styling ────────────────────────────────────
+    # ── CHANGED: Removed emoji from title — emojis break matplotlib rendering ──
+    ax.set_title(
+        "Worm Graph  |  Cumulative Mel-Band Energy: Healthy Baseline vs Current Engine",
+        color=TEXT_COLOR, fontsize=13, fontweight="bold", pad=12
+    )
+    ax.set_xlabel("Mel Frequency Band  (Low ← 0 ─── 127 → High)",
+                  color=TEXT_COLOR, fontsize=11)
+    ax.set_ylabel("Cumulative Energy (scaled 0–300)",
+                  color=TEXT_COLOR, fontsize=11)
+    ax.set_xlim(0, n_bands - 1)
+    ax.set_ylim(0, max(baseline_worm.max(), current_worm.max()) * 1.08)
+    ax.tick_params(colors=TEXT_COLOR)
+
+    for sp in ax.spines.values():
+        sp.set_edgecolor(GRID_COLOR)
+
+    legend = ax.legend(
+        loc="upper left", framealpha=0.25,
+        facecolor=BG_COLOR, edgecolor=GRID_COLOR,
+        labelcolor=TEXT_COLOR, fontsize=10
+    )
+
+    # Anomaly count badge (top-right corner)
+    if len(anomaly_bands) > 0:
+        ax.text(
+            0.98, 0.06,
+            f"[!] {len(anomaly_bands)} anomaly band(s) detected",  # CHANGED: no emoji
+            transform=ax.transAxes, color=FAIL_COLOR,
+            fontsize=10, fontweight="bold", ha="right", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.35",
+                      facecolor=BG_COLOR, edgecolor=FAIL_COLOR, alpha=0.85)
+        )
+    else:
+        ax.text(
+            0.98, 0.06,
+            "[OK] No anomaly bands detected",  # CHANGED: no emoji
+            transform=ax.transAxes, color=PASS_COLOR,
+            fontsize=10, fontweight="bold", ha="right", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.35",
+                      facecolor=BG_COLOR, edgecolor=PASS_COLOR, alpha=0.85)
+        )
+
+    fig.tight_layout()
+    # ── CHANGED: explicit plt.close prevents memory leak in Gradio ──────────
+    # Gradio renders the figure then we no longer need it in memory.
+    # Without close() repeated calls accumulate figures → eventual crash.
+    plt.close("all")  # CHANGED
+    return fig
+
+
+
+# ────────────────────────────────────────────────────────────
+# 4.  PLOT: ANOMALY INDICATORS  (per-feature red/green bars)
+# ────────────────────────────────────────────────────────────
+
+def plot_anomaly_indicators(file_path):
+    """
+    Per-feature z-score bar chart with colour-coded anomaly indicators.
+
+    Each of the 41 baseline features gets a bar showing how many
+    standard deviations the current engine is away from the healthy mean.
+
+    Colours
+    ───────
+    🟢 Green  — |z| < BASELINE_WARN_SIGMA   (within normal variation)
+    🟡 Orange — BASELINE_WARN_SIGMA ≤ |z| < BASELINE_FAIL_SIGMA  (warning)
+    🔴 Red    — |z| ≥ BASELINE_FAIL_SIGMA   (alert — strong anomaly)
+
+    Red dashed threshold lines and 🔴 emoji markers highlight alerts.
+
+    Parameters
+    ----------
+    file_path : str   Path to the current engine audio file.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure  or  None on error.
+    """
+    from acoustic_baseline import (
+        load_audio_for_baseline, normalize_audio,
+        build_feature_vector, build_feature_names
+    )
+
+    # ── Load baseline and test features ──────────────────────
+    baseline  = load_baseline()
+    mean_vec  = baseline["mean"]
+    std_vec   = baseline["std"]
+    feat_names = baseline.get("feature_names", build_feature_names())
+
+    audio, sr = load_audio_for_baseline(file_path)
+    if audio is None:
+        return None
+    audio     = normalize_audio(audio)
+    test_fvec = build_feature_vector(audio, sr)   # (41,)
+
+    # ── Compute per-feature z-scores ─────────────────────────
+    z_scores = (test_fvec - mean_vec) / std_vec    # (41,)
+    n        = len(z_scores)
+
+    # ── Assign colour per bar ─────────────────────────────────
+    bar_colors = []
+    for z in z_scores:
+        if abs(z) >= BASELINE_FAIL_SIGMA:
+            bar_colors.append(FAIL_COLOR)          # red alert
+        elif abs(z) >= BASELINE_WARN_SIGMA:
+            bar_colors.append(WARN_COLOR)          # orange warning
+        else:
+            bar_colors.append(PASS_COLOR)          # green OK
+
+    n_alert = bar_colors.count(FAIL_COLOR)
+    n_warn  = bar_colors.count(WARN_COLOR)
+
+    x = np.arange(n)
+
+    # ── Figure ────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 4.5))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+
+    # Background shading for threshold zones
+    y_abs_max = max(np.abs(z_scores).max() * 1.15, BASELINE_FAIL_SIGMA + 1.0)
+    ax.axhspan(-BASELINE_WARN_SIGMA,  BASELINE_WARN_SIGMA,
+               color=PASS_COLOR, alpha=0.05, zorder=0, label="_nolegend_")
+    ax.axhspan( BASELINE_WARN_SIGMA,  BASELINE_FAIL_SIGMA,
+               color=WARN_COLOR, alpha=0.07, zorder=0, label="_nolegend_")
+    ax.axhspan(-BASELINE_FAIL_SIGMA, -BASELINE_WARN_SIGMA,
+               color=WARN_COLOR, alpha=0.07, zorder=0, label="_nolegend_")
+    ax.axhspan( BASELINE_FAIL_SIGMA,  y_abs_max,
+               color=FAIL_COLOR, alpha=0.07, zorder=0, label="_nolegend_")
+    ax.axhspan(-y_abs_max, -BASELINE_FAIL_SIGMA,
+               color=FAIL_COLOR, alpha=0.07, zorder=0, label="_nolegend_")
+
+    # ── Feature bars ─────────────────────────────────────────
+    ax.bar(x, z_scores, color=bar_colors, width=0.75,
+           edgecolor="none", zorder=2, alpha=0.90)
+
+    # ── Threshold lines ───────────────────────────────────────
+    ax.axhline( BASELINE_WARN_SIGMA,  color=WARN_COLOR, linewidth=1.5,
+                linestyle="--", alpha=0.85, zorder=3,
+                label=f"Warning  ±{BASELINE_WARN_SIGMA}σ")
+    ax.axhline(-BASELINE_WARN_SIGMA,  color=WARN_COLOR, linewidth=1.5,
+                linestyle="--", alpha=0.85, zorder=3)
+    ax.axhline( BASELINE_FAIL_SIGMA,  color=FAIL_COLOR, linewidth=2.0,
+                linestyle="--", alpha=0.95, zorder=3,
+                label=f"Alert    ±{BASELINE_FAIL_SIGMA}σ")
+    ax.axhline(-BASELINE_FAIL_SIGMA,  color=FAIL_COLOR, linewidth=2.0,
+                linestyle="--", alpha=0.95, zorder=3)
+    ax.axhline(0, color=GRID_COLOR, linewidth=0.8, alpha=0.6, zorder=1)
+
+    # ── Red 🔴 markers above / below alert bars ───────────────
+    for i, (z, c) in enumerate(zip(z_scores, bar_colors)):
+        if c == FAIL_COLOR:
+            # Place marker just beyond the bar tip
+            y_tip    = z + (0.25 if z >= 0 else -0.25)
+            ax.text(i, y_tip, "🔴",
+                    fontsize=8, ha="center", va="center",
+                    zorder=6)
+
+    # ── Feature group dividers + colour labels ────────────────
+    groups = [
+        (0,  20, "MFCC (×20)",          "#3498DB"),
+        (20, 32, "Chroma (×12)",         "#9B59B6"),
+        (32, 39, "Spectral\nContrast (×7)", "#1ABC9C"),
+        (39, 40, "RMS",                  "#E67E22"),
+        (40, 41, "ZCR",                  "#E74C3C"),
+    ]
+    for (start, end, label, gcolor) in groups:
+        mid = (start + end - 1) / 2.0
+        # Group label below x-axis
+        ax.text(mid, -y_abs_max * 0.97,
+                label, color=gcolor, fontsize=8, ha="center",
+                va="top", fontweight="bold", zorder=5)
+        # Vertical divider between groups
+        if start > 0:
+            ax.axvline(start - 0.5,
+                       color=GRID_COLOR, linewidth=0.8,
+                       linestyle=":", alpha=0.6, zorder=1)
+
+    # ── Axes styling ─────────────────────────────────────────
+    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_ylim(-y_abs_max, y_abs_max)
+    ax.set_xticks(x[::5])
+    ax.set_xticklabels([str(i) for i in x[::5]],
+                       color=TEXT_COLOR, fontsize=8)
+    ax.tick_params(colors=TEXT_COLOR)
+
+    # ── CHANGED: Removed emoji from title to prevent matplotlib render failure ─
+    ax.set_title(
+        "Anomaly Indicators  |  Per-Feature Deviation from Healthy Baseline",
+        color=TEXT_COLOR, fontsize=13, fontweight="bold", pad=10
+    )
+    ax.set_xlabel("Feature Index  (0–40)",
+                  color=TEXT_COLOR, fontsize=10)
+    ax.set_ylabel("Z-Score  (σ deviations from baseline)",
+                  color=TEXT_COLOR, fontsize=10)
+
+    for sp in ax.spines.values():
+        sp.set_edgecolor(GRID_COLOR)
+    ax.grid(axis="y", color=GRID_COLOR, alpha=0.3, linewidth=0.4)
+
+    ax.legend(
+        loc="upper right", framealpha=0.25,
+        facecolor=BG_COLOR, edgecolor=GRID_COLOR,
+        labelcolor=TEXT_COLOR, fontsize=9
+    )
+
+    # ── Summary badge ─────────────────────────────────────────
+    if n_alert > 0 or n_warn > 0:
+        badge_color = FAIL_COLOR if n_alert > 0 else WARN_COLOR
+        # CHANGED: plain text badge — no emoji in matplotlib text
+        badge_text  = (f"[ALERT] {n_alert} alerts   [WARN] {n_warn} warnings"
+                       f"   of {n} features")
+    else:
+        badge_color = PASS_COLOR
+        badge_text  = f"[OK]  All {n} features within healthy range"  # CHANGED: no emoji
+
+    ax.text(
+        0.01, 0.97, badge_text,
+        transform=ax.transAxes, color=badge_color,
+        fontsize=9, va="top", ha="left", fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.35",
+                  facecolor=BG_COLOR, edgecolor=badge_color, alpha=0.85)
+    )
+
+    fig.tight_layout()
+    return fig
+
+
+
+
+# ────────────────────────────────────────────────────────────
+# 5.  PLOT: WAVEFORM
+# ────────────────────────────────────────────────────────────
+def plot_waveform(audio, sr, status):
+    # CHANGED — WARNING uses orange colour instead of always red/green
+    if status == "PASS":
+        color = PASS_COLOR
+    elif status == "WARNING":
+        color = WARN_COLOR                             # CHANGED — orange for WARNING
+    else:
+        color = FAIL_COLOR
+
+    fig, ax = plt.subplots(figsize=(10, 3))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    librosa.display.waveshow(audio, sr=sr, ax=ax, color=color, alpha=0.85)
+    ax.set_title("Engine Sound Waveform", color=TEXT_COLOR, fontsize=13, fontweight="bold", pad=10)
+    ax.set_xlabel("Time (seconds)", color=TEXT_COLOR)
+    ax.set_ylabel("Amplitude",      color=TEXT_COLOR)
+    ax.tick_params(colors=TEXT_COLOR)
+    ax.spines["bottom"].set_color(GRID_COLOR)
+    ax.spines["left"].set_color(GRID_COLOR)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, color=GRID_COLOR, alpha=0.5, linewidth=0.5)
+    fig.tight_layout()
+    return fig
+
+
+# ────────────────────────────────────────────────────────────
+# 6.  PLOT: SPECTROGRAM
+# ────────────────────────────────────────────────────────────
+def plot_spectrogram(audio, sr):
+    D = get_spectrogram_data(audio, sr)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    img = librosa.display.specshow(
+        D, sr=sr, hop_length=HOP_LENGTH,
+        x_axis="time", y_axis="hz", ax=ax, cmap="inferno"
+    )
+    cbar = fig.colorbar(img, ax=ax, format="%+2.0f dB")
+    cbar.ax.yaxis.set_tick_params(color=TEXT_COLOR)
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color=TEXT_COLOR)
+    ax.set_title("Frequency Spectrogram", color=TEXT_COLOR, fontsize=13, fontweight="bold", pad=10)
+    ax.set_xlabel("Time (seconds)", color=TEXT_COLOR)
+    ax.set_ylabel("Frequency (Hz)", color=TEXT_COLOR)
+    ax.tick_params(colors=TEXT_COLOR)
+    for spine in ax.spines.values():
+        spine.set_edgecolor(GRID_COLOR)
+    fig.tight_layout()
+    return fig
+
+
+# ────────────────────────────────────────────────────────────
+# 7.  PLOT: MEL SPECTROGRAM
+# ────────────────────────────────────────────────────────────
+def plot_mel_spectrogram(audio, sr):
+    mel_db = get_mel_spectrogram_data(audio, sr)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    img = librosa.display.specshow(
+        mel_db, sr=sr, hop_length=HOP_LENGTH,
+        x_axis="time", y_axis="mel", ax=ax, cmap="magma"
+    )
+    cbar = fig.colorbar(img, ax=ax, format="%+2.0f dB")
+    cbar.ax.yaxis.set_tick_params(color=TEXT_COLOR)
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color=TEXT_COLOR)
+    ax.set_title("Mel Spectrogram", color=TEXT_COLOR, fontsize=13, fontweight="bold", pad=10)
+    ax.set_xlabel("Time (seconds)", color=TEXT_COLOR)
+    ax.set_ylabel("Mel Frequency",  color=TEXT_COLOR)
+    ax.tick_params(colors=TEXT_COLOR)
+    for spine in ax.spines.values():
+        spine.set_edgecolor(GRID_COLOR)
+    fig.tight_layout()
+    return fig
+
+
+# ────────────────────────────────────────────────────────────
+# 8.  PLOT: CONFIDENCE GAUGE
+# ────────────────────────────────────────────────────────────
+def plot_confidence_gauge(prob_normal, prob_abnormal, status):
+    fig, ax = plt.subplots(figsize=(7, 2.5))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    categories = ["Normal", "Abnormal"]
+    values     = [prob_normal * 100, prob_abnormal * 100]
+    colors     = [PASS_COLOR, FAIL_COLOR]
+    bars = ax.barh(categories, values, color=colors, height=0.5, edgecolor="none")
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_width() + 1.5, bar.get_y() + bar.get_height() / 2,
+            f"{val:.1f}%", va="center", ha="left",
+            color=TEXT_COLOR, fontsize=12, fontweight="bold"
+        )
+    ax.set_xlim(0, 115)
+    ax.set_title("AI Confidence Scores", color=TEXT_COLOR, fontsize=13, fontweight="bold")
+    ax.tick_params(colors=TEXT_COLOR, labelsize=11)
+    ax.set_xlabel("Probability (%)", color=TEXT_COLOR)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.axvline(50, color=GRID_COLOR, linewidth=1, linestyle="--", alpha=0.6)
+    ax.grid(axis="x", color=GRID_COLOR, alpha=0.4)
+    fig.tight_layout()
+    return fig
+
+
+# ────────────────────────────────────────────────────────────
+# 9.  COMBINED: ALL PLOTS
+# ────────────────────────────────────────────────────────────
+def generate_all_plots(file_path, status, prob_normal, prob_abnormal):
+    """Generate all four core visualisation figures."""
+    audio, sr = load_audio(file_path)
+    waveform_fig    = plot_waveform(audio, sr, status)
+    spectrogram_fig = plot_spectrogram(audio, sr)
+    mel_fig         = plot_mel_spectrogram(audio, sr)
+    gauge_fig       = plot_confidence_gauge(prob_normal, prob_abnormal, status)
+    return waveform_fig, spectrogram_fig, mel_fig, gauge_fig
+
+
+# ────────────────────────────────────────────────────────────
+# 10.  FORMAT RESULT TEXT
+# ────────────────────────────────────────────────────────────
+def format_result_text(status, confidence, prob_normal, prob_abnormal,
+                        pass_threshold, ensemble_explanation=""):
+    """
+    CHANGED (Task 7) — Updated to show three zones, adaptive threshold,
+    and ensemble explanation so the engineer understands every decision.
+    """
+    # CHANGED — three-zone status icon
+    if status == "PASS":
+        status_icon = "[PASS]"
+    elif status == "WARNING":
+        status_icon = "[WARNING]"                          # CHANGED
+    else:
+        status_icon = "[FAIL]"
+
+    warn_thr = pass_threshold * 0.70
+
+    lines = [
+        "=" * 48,
+        "  ENGINE DIAGNOSTIC REPORT  (Ensemble System)",
+        "=" * 48,
+        f"  Final Status     : {status_icon}  ENGINE {status}",
+        f"  Confidence       : {confidence:.1f}%",
+        "-" * 48,
+        f"  RF Normal Score  : {prob_normal   * 100:.1f}%",
+        f"  RF Abnorm Score  : {prob_abnormal * 100:.1f}%",
+        "-" * 48,
+        # CHANGED — show all three thresholds clearly
+        f"  PASS  threshold  : >= {pass_threshold*100:.1f}%  (adaptive from training)",
+        f"  WARN  threshold  : >= {warn_thr*100:.1f}%",
+        f"  FAIL  threshold  : <  {warn_thr*100:.1f}%",
+        "-" * 48,
+    ]
+
+    if ensemble_explanation:
+        lines.append(f"  Ensemble votes   : {ensemble_explanation}")
+        lines.append("-" * 48)
+
+    # CHANGED — three-zone result messages
+    if status == "PASS":
+        lines.append("  Result : No acoustic anomaly detected.")
+        lines.append("           Engine sounds within normal range.")
+    elif status == "WARNING":                              # CHANGED — WARNING zone
+        gap = pass_threshold * 100 - prob_normal * 100
+        lines.append("  Result : BORDERLINE — engine sound is within")
+        lines.append(f"           the WARNING zone ({gap:.1f}% below PASS).")
+        lines.append("           Re-test recommended before final decision.")
+    else:
+        lines.append("  Result : ABNORMAL acoustic signature detected!")
+        lines.append("           Engine requires immediate inspection.")
+
+    lines.append("=" * 48)
+    return "\n".join(lines)
+
+
+# ────────────────────────────────────────────────────────────
+# 11.  BASELINE COMPARISON (unchanged logic, extracted here)
+# ────────────────────────────────────────────────────────────
+def compute_baseline_distance(file_path):
+    """Compare a test audio file against the healthy baseline."""
+    from acoustic_baseline import (
+        load_audio_for_baseline, normalize_audio, build_feature_vector
+    )
+    baseline   = load_baseline()
+    mean_vec   = baseline["mean"]
+    std_vec    = baseline["std"]
+    intra_mean = baseline["intra_mean"]
+    intra_std  = baseline["intra_std"]
+    n_samples  = baseline["n_samples"]
+
+    audio, sr = load_audio_for_baseline(file_path)
+    if audio is None:
+        raise RuntimeError("Could not load audio for baseline comparison.")
+    audio     = normalize_audio(audio)
+    test_fvec = build_feature_vector(audio, sr)
+
+    z_scores = (test_fvec - mean_vec) / std_vec
+    distance = float(np.linalg.norm(z_scores))
+
+    sigma = 0.0 if intra_std < 1e-9 else (distance - intra_mean) / intra_std
+
+    if sigma < BASELINE_WARN_SIGMA:
+        risk_level = "OK"
+    elif sigma < BASELINE_FAIL_SIGMA:
+        risk_level = "WARNING"
+    else:
+        risk_level = "ALERT"
+
+    report_text = _format_baseline_report(distance, sigma, risk_level,
+                                           intra_mean, intra_std, n_samples)
+    return distance, sigma, risk_level, report_text
+
+
+def _format_baseline_report(distance, sigma, risk_level, intra_mean, intra_std, n_samples):
+    icon_map = {"OK": "[OK]", "WARNING": "[WARN]", "ALERT": "[ALERT]"}
+    icon     = icon_map.get(risk_level, "?")
+    lines = [
+        "-" * 45,
+        "  BASELINE COMPARISON REPORT",
+        "-" * 45,
+        f"  Risk Level        : {icon}  {risk_level}",
+        f"  Distance Score    : {distance:.4f}",
+        f"  Sigma (sigma)     : {sigma:+.2f} std deviations",
+        "-" * 45,
+        f"  Healthy Baseline  : built from {n_samples} samples",
+        f"  Intra-class Mean  : {intra_mean:.4f}",
+        f"  Intra-class Std   : {intra_std:.4f}",
+        "-" * 45,
+    ]
+    if risk_level == "OK":
+        lines.append("  Interpretation : Sound signature is CLOSE to the baseline.")
+    elif risk_level == "WARNING":
+        lines.append("  Interpretation : Sound signature NOTICEABLY different.")
+        lines.append("                   Recommend re-inspection.")
+    else:
+        lines.append("  Interpretation : Sound STRONGLY DEVIATES from baseline.")
+        lines.append("                   Immediate inspection advised.")
+    lines.append("-" * 45)
+    return "\n".join(lines)
+
+
+def plot_baseline_comparison(distance, sigma, risk_level):
+    """Sigma gauge plot."""
+    fig, ax = plt.subplots(figsize=(8, 2.5))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    ax.barh([0], [BASELINE_WARN_SIGMA], color=PASS_COLOR, height=0.5, alpha=0.35, left=0)
+    ax.barh([0], [BASELINE_FAIL_SIGMA - BASELINE_WARN_SIGMA],
+            color=WARN_COLOR, height=0.5, alpha=0.35, left=BASELINE_WARN_SIGMA)
+    ax.barh([0], [max(sigma + 2, BASELINE_FAIL_SIGMA + 2) - BASELINE_FAIL_SIGMA],
+            color=FAIL_COLOR, height=0.5, alpha=0.25, left=BASELINE_FAIL_SIGMA)
+    display_sigma = max(sigma, 0.05)
+    color_map     = {"OK": PASS_COLOR, "WARNING": WARN_COLOR, "ALERT": FAIL_COLOR}
+    marker_color  = color_map.get(risk_level, TEXT_COLOR)
+    ax.axvline(display_sigma, color=marker_color, linewidth=3, zorder=5)
+    ax.text(display_sigma, 0.32, f"sigma={sigma:+.2f}",
+            color=marker_color, fontsize=11, fontweight="bold", ha="center", va="bottom")
+    ax.text(BASELINE_WARN_SIGMA / 2,                          -0.32, "OK",      color=PASS_COLOR, ha="center", fontsize=9)
+    ax.text((BASELINE_WARN_SIGMA + BASELINE_FAIL_SIGMA) / 2,  -0.32, "WARNING", color=WARN_COLOR, ha="center", fontsize=9)
+    ax.text(BASELINE_FAIL_SIGMA + 1,                          -0.32, "ALERT",   color=FAIL_COLOR, ha="center", fontsize=9)
+    ax.axvline(BASELINE_WARN_SIGMA, color=WARN_COLOR, linewidth=1, linestyle="--", alpha=0.7)
+    ax.axvline(BASELINE_FAIL_SIGMA, color=FAIL_COLOR, linewidth=1, linestyle="--", alpha=0.7)
+    max_x = max(sigma + 1.5, BASELINE_FAIL_SIGMA + 2)
+    ax.set_xlim(0, max_x)
+    ax.set_ylim(-0.5, 0.6)
+    ax.set_yticks([])
+    ax.set_xlabel("Sigma — distance from healthy baseline", color=TEXT_COLOR, fontsize=10)
+    ax.set_title("Baseline Distance Gauge", color=TEXT_COLOR, fontsize=12, fontweight="bold")
+    ax.tick_params(colors=TEXT_COLOR)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    ax.grid(axis="x", color=GRID_COLOR, alpha=0.4)
+    fig.tight_layout()
+    return fig
