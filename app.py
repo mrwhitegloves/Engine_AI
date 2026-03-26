@@ -892,12 +892,6 @@ def build_ui():
         # Engine Acoustic Intelligence System
         **Three-layer analysis: RF Classifier · Acoustic Baseline · Multi-File Statistics**
         """)
-                gr.Image(
-        value="ForBlack.png",   # path to your logo file
-        show_label=False,
-        width=150,          # adjust size
-        height=50
-    )
 
         # ════════════════════════════════════════════════════
         # TAB 1 — ENGINE DIAGNOSIS  (unchanged)
@@ -1137,32 +1131,32 @@ def build_ui():
                     value=5, step=0.1)
             zoomed_waveform_plot = gr.Plot(label="Zoomed Waveform")  # NEW
 
-            # ── SECTION 3: Frequency Analysis (FFT) ──────────
-            gr.Markdown("---")
-            gr.Markdown("### Frequency Analysis (FFT)")
+            # # ── SECTION 3: Frequency Analysis (FFT) ──────────
+            # gr.Markdown("---")
+            # gr.Markdown("### Frequency Analysis (FFT)")
 
-            fft_file_dropdown = gr.Dropdown(
-                label   = "Select file for FFT",
-                choices = [],
-            )
-            freq_limit_slider = gr.Slider(
-                label   = "Frequency limit (Hz)",
-                minimum = 100,
-                maximum = 20000,
-                value   = 5000,
-                step    = 100,
-            )
-            fft_plot = gr.Plot(label="FFT Spectrum")
+            # fft_file_dropdown = gr.Dropdown(
+            #     label   = "Select file for FFT",
+            #     choices = [],
+            # )
+            # freq_limit_slider = gr.Slider(
+            #     label   = "Frequency limit (Hz)",
+            #     minimum = 100,
+            #     maximum = 20000,
+            #     value   = 5000,
+            #     step    = 100,
+            # )
+            # fft_plot = gr.Plot(label="FFT Spectrum")
 
-            # ── SECTION 4: Spectrogram ────────────────────────
-            gr.Markdown("---")
-            gr.Markdown("### Spectrogram Analysis")
+            # # ── SECTION 4: Spectrogram ────────────────────────
+            # gr.Markdown("---")
+            # gr.Markdown("### Spectrogram Analysis")
 
-            spec_file_dropdown = gr.Dropdown(
-                label   = "Select file for spectrogram",
-                choices = [],
-            )
-            spectrogram_plot = gr.Plot(label="Spectrogram (dB)")
+            # spec_file_dropdown = gr.Dropdown(
+            #     label   = "Select file for spectrogram",
+            #     choices = [],
+            # )
+            # spectrogram_plot = gr.Plot(label="Spectrogram (dB)")
 
             # ── SECTION 5: Group Comparison ───────────────────
             gr.Markdown("---")
@@ -1297,7 +1291,7 @@ def build_ui():
             waveform_file_dropdown.change(
                 fn      = sync_all_dropdowns,
                 inputs  = [waveform_file_dropdown],
-                outputs = [fft_file_dropdown, spec_file_dropdown],
+                # outputs = [fft_file_dropdown, spec_file_dropdown],
             )
 
             # ── Wire: per-file view callbacks ─────────────────
@@ -1305,19 +1299,19 @@ def build_ui():
                 fn=view_waveform, inputs=[waveform_file_dropdown],
                 outputs=[waveform_plot])
 
-            fft_file_dropdown.change(
-                fn=view_fft,
-                inputs=[fft_file_dropdown, freq_limit_slider],
-                outputs=[fft_plot])
+            # fft_file_dropdown.change(
+            #     fn=view_fft,
+            #     inputs=[fft_file_dropdown, freq_limit_slider],
+            #     outputs=[fft_plot])
 
-            freq_limit_slider.change(
-                fn=view_fft,
-                inputs=[fft_file_dropdown, freq_limit_slider],
-                outputs=[fft_plot])
+            # freq_limit_slider.change(
+            #     fn=view_fft,
+            #     inputs=[fft_file_dropdown, freq_limit_slider],
+            #     outputs=[fft_plot])
 
-            spec_file_dropdown.change(
-                fn=view_spectrogram, inputs=[spec_file_dropdown],
-                outputs=[spectrogram_plot])
+            # spec_file_dropdown.change(
+            #     fn=view_spectrogram, inputs=[spec_file_dropdown],
+            #     outputs=[spectrogram_plot])
 
             # ── Wire: bad/good file lists ─────────────────────
             def update_file_lists(anomaly_df):
@@ -1372,17 +1366,17 @@ def build_ui():
                 outputs = analyse_outputs,                     # NEW (same outputs as upload)
             )
 
-            # ── Wire: CSV download ────────────────────────────
-            def download_csv():
-                df = _DF_CACHE.get("df")
-                if df is None:
-                    return None
-                path = "models/audio_statistics.csv"
-                df.to_csv(path, index=False)
-                return path
+            # # ── Wire: CSV download ────────────────────────────
+            # def download_csv():
+            #     df = _DF_CACHE.get("df")
+            #     if df is None:
+            #         return None
+            #     path = "models/audio_statistics.csv"
+            #     df.to_csv(path, index=False)
+            #     return path
 
-            stats_download_btn.click(
-                fn=download_csv, inputs=[], outputs=[gr.File(label="Download CSV")])
+            # stats_download_btn.click(
+            #     fn=download_csv, inputs=[], outputs=[gr.File(label="Download CSV")])
 
         gr.Markdown("---\n*Engine Acoustic Diagnostic AI — EngenX*")
 

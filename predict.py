@@ -296,192 +296,206 @@ def load_baseline():
     return joblib.load(BASELINE_PATH)
 
 # ────────────────────────────────────────────────────────────
-# 3.  PLOT: WORM GRAPH  (cricket-style cumulative energy chart)
+# 3.  PLOT: WORM GRAPH  (V3 Update: single panel, time-axis)
 # ────────────────────────────────────────────────────────────
 
 def plot_worm_graph(file_path):
     """
-    Cricket-style worm graph that compares cumulative mel-band energy
-    of the Healthy Baseline vs the Current Engine recording.
+    V3 Update: Single-panel cricket-style worm graph.
 
-    Concept (mirrors the cricket worm chart in the screenshot):
-    ──────────────────────────────────────────────────────────
-    X axis : Mel frequency band index  0 → N_MELS-1   (like "overs")
-    Y axis : Cumulative energy (scaled 0–300)          (like "total runs")
+    Requested change vs V2 (4-panel):
+      - Back to ONE panel (matches the reference screenshot style)
+      - X-axis = TIME IN SECONDS  (was: mel band index 0-127)
+      - Y-axis = Cumulative Energy (same cricket-score metaphor)
 
-    Lines
-    ─────
-    Blue  + circle markers  =  Healthy Baseline (Good Engine)
-    Grey  + square markers  =  Current Engine
-    Red filled circles      =  Anomaly bands (current deviates from baseline)
-    Red vertical shading    =  Region of anomaly
+    How the time-based worm works
+    ─────────────────────────────
+    1. Compute mel spectrogram for the current engine  → (n_mels, n_frames)
+    2. Average over mel bands per frame                → (n_frames,)  "energy at each moment"
+    3. Cumulative sum over frames                      → always-rising worm curve
+    4. Baseline = constant energy per frame (mean of baseline mel bands)
+       gives a perfectly straight reference line — any deviation = anomaly
 
-    Parameters
-    ----------
-    file_path : str   Path to the current engine audio file.
+    Anomaly detection (kept from V2)
+    ────────────────────────────────
+    - z_score per frame = (current_frame_energy - baseline_mean) / baseline_std_est
+    - Flag frames where |z| > ZSCORE_THRESH (1.5)
+    - Show as red dots on the current engine line + red vertical shading
 
-    Returns
-    -------
-    fig : matplotlib.figure.Figure  or  None if baseline has no mel data.
+    Visual style (matches reference screenshot)
+    ───────────────────────────────────────────
+    Blue  + circle markers  = Healthy Baseline (straight cumulative line)
+    Grey  + square markers  = Current Engine
+    Red filled circles      = Anomaly time moments
+    Red vertical shading    = Anomaly regions
     """
-    # ── Inline imports to avoid circular deps ────────────────
-    from acoustic_baseline import (
-        load_audio_for_baseline, normalize_audio
-    )
+    from acoustic_baseline import load_audio_for_baseline, normalize_audio
+    from config import N_MELS as _N_MELS
 
-    # ── Load baseline mel data ────────────────────────────────
-    baseline     = load_baseline()
-    baseline_mel = baseline.get("avg_mel_per_band", None)
+    # ── Load baseline ─────────────────────────────────────────
+    baseline_data = load_baseline()
+    baseline_mel  = baseline_data.get("avg_mel_per_band", None)
 
-    # ── CHANGED: Load current engine audio FIRST ─────────────
-    # We need the audio regardless of whether baseline_mel exists,
-    # so we load it here and use it as fallback if baseline has no mel data.
+    # ── Load + normalize current audio ────────────────────────
     audio, sr = load_audio_for_baseline(file_path)
     if audio is None:
-        return None                              # genuine load error — give up
-    audio = normalize_audio(audio)
+        return None
+    audio   = normalize_audio(audio)
+    n_bands = _N_MELS   # 128
 
-    from config import N_MELS as _N_MELS         # CHANGED: local import for N_MELS
-    n_bands = _N_MELS                            # = 128
-
-    # Compute current engine per-band mel energy (always needed)
-    mel = librosa.feature.melspectrogram(
-        y=audio, sr=sr,
-        n_mels=n_bands, n_fft=N_FFT, hop_length=HOP_LENGTH
+    # ── V3 Update: mel spectrogram keeping TIME axis intact ───────────────────
+    # We keep the full (n_mels, n_frames) matrix so we can plot over TIME.
+    # ref=1.0 is kept from V2 — absolute reference prevents false overlap.
+    mel     = librosa.feature.melspectrogram(
+        y=audio, sr=sr, n_mels=n_bands, n_fft=N_FFT, hop_length=HOP_LENGTH
     )
-    mel_db      = librosa.power_to_db(mel, ref=np.max)
-    current_mel = np.mean(mel_db, axis=1)        # (128,) mean energy per mel band
+    mel_db  = librosa.power_to_db(mel, ref=1.0)          # V3 Update: absolute ref (from V2)
 
-    # ── CHANGED: Fallback when baseline has no mel data ───────
-    # Old baseline.pkl (built before avg_mel_per_band was added) will have
-    # None here. Instead of returning None (blank plot), we fall back to
-    # using the current file itself as the "baseline" so the graph renders
-    # and the user sees at least the current engine curve.
-    if baseline_mel is None or np.all(baseline_mel == 0):
-        baseline_mel = current_mel.copy()        # CHANGED: fallback, not return None
+    # V3 Update: mean over mel bands → one energy value per TIME FRAME
+    # Shape: (n_frames,)  — "how loud is the engine at each moment in time"
+    current_energy_frames = np.mean(mel_db, axis=0)       # V3 Update: energy per time frame
 
-    # ── Build cumulative worm curves ─────────────────────────
-    #   Shift both series so the minimum is 0 (dB values can be negative).
-    #   Then cumulative sum → always increasing curve like cricket scoring.
-    offset          = min(baseline_mel.min(), current_mel.min())
-    baseline_shifted = baseline_mel - offset   # all ≥ 0
-    current_shifted  = current_mel  - offset   # all ≥ 0
+    # V3 Update: time axis in real seconds
+    n_frames   = current_energy_frames.shape[0]
+    time_axis  = librosa.frames_to_time(                  # V3 Update: convert frames → seconds
+        np.arange(n_frames), sr=sr, hop_length=HOP_LENGTH
+    )
+    total_time = float(time_axis[-1])
 
-    baseline_cumsum = np.cumsum(baseline_shifted)   # (128,)
-    current_cumsum  = np.cumsum(current_shifted)    # (128,)
+    # ── V3 Update: baseline reference energy ──────────────────────────────────
+    # The baseline pkl stores avg_mel_per_band (shape 128,) = mean dB per band.
+    # Mean of this vector = expected mean energy per time frame.
+    # This gives a CONSTANT energy per frame → straight cumulative line
+    # (a healthy engine runs at a steady level, like scoring at a constant rate).
+    if baseline_mel is not None and not np.all(baseline_mel == 0):
+        baseline_frame_mean = float(np.mean(baseline_mel))    # V3 Update: scalar mean energy
+    else:
+        baseline_frame_mean = float(np.mean(current_energy_frames))  # fallback
 
-    # Scale both curves so the baseline tops out at 300 (like cricket score)
-    scale_factor    = 300.0 / (baseline_cumsum[-1] + 1e-9)
-    baseline_worm   = baseline_cumsum * scale_factor
-    current_worm    = current_cumsum  * scale_factor
+    # V3 Update: baseline std estimated from intra_std in the pkl
+    intra_std            = float(baseline_data.get("intra_std", 1.0))
+    baseline_frame_std   = abs(baseline_frame_mean) * (intra_std / 10.0) + 1e-6  # V3 Update
 
-    # ── Detect anomaly bands ──────────────────────────────────
-    #   Anomaly = bands where raw per-band diff > mean + 2*std
-    per_band_diff   = np.abs(current_mel - baseline_mel)
-    diff_thresh     = np.mean(per_band_diff) + 2.0 * np.std(per_band_diff)
-    anomaly_bands   = np.where(per_band_diff > diff_thresh)[0]   # indices
+    # V3 Update: baseline worm = perfectly straight line (constant energy/frame)
+    baseline_energy_frames = np.full(n_frames, baseline_frame_mean)              # V3 Update
 
-    # ── Marker positions (every N_MELS/20 bands, like cricket overs) ─────
-    step     = max(1, n_bands // 20)
-    mark_x   = np.arange(0, n_bands, step)
+    # ── V3 Update: cumulative worm curves (over time, not over mel bands) ─────
+    # Shift so both curves start at 0 (dB values can be negative)
+    offset           = min(baseline_frame_mean, current_energy_frames.min())
+    b_shifted        = np.clip(baseline_energy_frames - offset, 0, None)
+    c_shifted        = np.clip(current_energy_frames  - offset, 0, None)
 
-    # ── Figure ────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(12, 5))
+    b_cum            = np.cumsum(b_shifted)
+    c_cum            = np.cumsum(c_shifted)
+
+    # V3 Update: scale from baseline only (fix from V2 — prevents forced overlap)
+    scale_f          = 300.0 / (b_cum[-1] + 1e-9)         # V3 Update: baseline-only scale
+    baseline_worm    = b_cum * scale_f
+    current_worm     = c_cum * scale_f                     # V3 Update: current uses baseline scale
+
+    # ── V3 Update: anomaly detection on TIME frames ───────────────────────────
+    ZSCORE_THRESH    = 1.5                                 # V3 Update: 1.5σ (kept from V2)
+    z_per_frame      = (current_energy_frames - baseline_frame_mean) / baseline_frame_std
+    anomaly_frames   = np.where(np.abs(z_per_frame) > ZSCORE_THRESH)[0]          # V3 Update
+
+    # V3 Update: anomaly times in seconds (for vertical shading)
+    anomaly_times    = time_axis[anomaly_frames]           # V3 Update: real time positions
+
+    # ── Marker step — one dot per ~0.5 seconds (like cricket overs) ──────────
+    # V3 Update: markers spaced in time, not in band index
+    marker_step      = max(1, n_frames // 20)             # V3 Update: ~20 markers total
+    mark_idx         = np.arange(0, n_frames, marker_step)
+
+    # ═══════════════════════════════════════════════════════════
+    # V3 Update: SINGLE PANEL figure (was 4-panel in V2)
+    # ═══════════════════════════════════════════════════════════
+    fig, ax = plt.subplots(figsize=(13, 5))               # V3 Update: single axis
     fig.patch.set_facecolor(BG_COLOR)
     ax.set_facecolor(BG_COLOR)
 
-    # Red vertical shading at every anomaly band
-    for band in anomaly_bands:
-        ax.axvspan(band - 0.5, band + 0.5, color=FAIL_COLOR, alpha=0.18, zorder=1)
+    # V3 Update: red vertical shading at anomaly TIME positions
+    for t in anomaly_times:
+        ax.axvspan(t - 0.02, t + 0.02,                   # V3 Update: time-width shading
+                   color=FAIL_COLOR, alpha=0.20, zorder=1)
 
-    # ── Healthy baseline line (blue + circles) ────────────────
+    # ── Healthy baseline line — blue + circle markers ─────────
     ax.plot(
-        np.arange(n_bands), baseline_worm,
+        time_axis, baseline_worm,
         color="#3498DB", linewidth=2.2, alpha=0.95,
         label="Good Engine (Baseline)", zorder=3
     )
     ax.plot(
-        mark_x, baseline_worm[mark_x],
+        time_axis[mark_idx], baseline_worm[mark_idx],
         "o", color="#3498DB", markersize=7,
         markerfacecolor="#3498DB", markeredgecolor=BG_COLOR,
         markeredgewidth=1.2, zorder=4
     )
 
-    # ── Current engine line (grey + squares) ─────────────────
+    # ── Current engine line — grey + square markers ───────────
     ax.plot(
-        np.arange(n_bands), current_worm,
+        time_axis, current_worm,
         color="#95A5A6", linewidth=2.2, alpha=0.95,
         label="Current Engine", zorder=3
     )
     ax.plot(
-        mark_x, current_worm[mark_x],
+        time_axis[mark_idx], current_worm[mark_idx],
         "s", color="#95A5A6", markersize=7,
         markerfacecolor="#95A5A6", markeredgecolor=BG_COLOR,
         markeredgewidth=1.2, zorder=4
     )
 
-    # ── Red anomaly markers on the current engine line ────────
-    if len(anomaly_bands) > 0:
+    # ── Red anomaly dots on the current engine worm ───────────
+    if len(anomaly_frames) > 0:
         ax.plot(
-            anomaly_bands, current_worm[anomaly_bands],
+            anomaly_times, current_worm[anomaly_frames],
             "o", color=FAIL_COLOR, markersize=11, zorder=5,
-            label=f"Anomaly Band ({len(anomaly_bands)})",  # CHANGED: removed emoji from label
-            markerfacecolor=FAIL_COLOR, markeredgecolor="#FFD0D0",
-            markeredgewidth=1.5
+            label=f"Anomaly Moment ({len(anomaly_frames)})",
+            markerfacecolor=FAIL_COLOR,
+            markeredgecolor="#FFD0D0", markeredgewidth=1.5
         )
 
-    # ── Horizontal reference lines ────────────────────────────
+    # ── Horizontal reference grid lines (like cricket score grid) ────────────
     for y_val in [50, 100, 150, 200, 250, 300]:
         ax.axhline(y_val, color=GRID_COLOR, linewidth=0.5, alpha=0.5, zorder=0)
 
-    # ── Labels and styling ────────────────────────────────────
-    # ── CHANGED: Removed emoji from title — emojis break matplotlib rendering ──
+    # ── Axis labels, title, limits ────────────────────────────
     ax.set_title(
-        "Worm Graph  |  Cumulative Mel-Band Energy: Healthy Baseline vs Current Engine",
+        "Worm Graph  |  Cumulative Energy vs Time: Healthy Baseline vs Current Engine",
         color=TEXT_COLOR, fontsize=13, fontweight="bold", pad=12
     )
-    ax.set_xlabel("Mel Frequency Band  (Low ← 0 ─── 127 → High)",
+    # V3 Update: X-axis is TIME IN SECONDS (was mel band index)
+    ax.set_xlabel("Time (seconds)",                       # V3 Update: time axis label
                   color=TEXT_COLOR, fontsize=11)
-    ax.set_ylabel("Cumulative Energy (scaled 0–300)",
+    ax.set_ylabel("Cumulative Energy (scaled 0-300 from baseline)",
                   color=TEXT_COLOR, fontsize=11)
-    ax.set_xlim(0, n_bands - 1)
-    ax.set_ylim(0, max(baseline_worm.max(), current_worm.max()) * 1.08)
+    ax.set_xlim(0, total_time)                            # V3 Update: time range
+    ax.set_ylim(0, max(baseline_worm.max(), current_worm.max()) * 1.10)
     ax.tick_params(colors=TEXT_COLOR)
 
     for sp in ax.spines.values():
         sp.set_edgecolor(GRID_COLOR)
 
-    legend = ax.legend(
+    ax.legend(
         loc="upper left", framealpha=0.25,
         facecolor=BG_COLOR, edgecolor=GRID_COLOR,
         labelcolor=TEXT_COLOR, fontsize=10
     )
 
-    # Anomaly count badge (top-right corner)
-    if len(anomaly_bands) > 0:
-        ax.text(
-            0.98, 0.06,
-            f"[!] {len(anomaly_bands)} anomaly band(s) detected",  # CHANGED: no emoji
-            transform=ax.transAxes, color=FAIL_COLOR,
-            fontsize=10, fontweight="bold", ha="right", va="bottom",
-            bbox=dict(boxstyle="round,pad=0.35",
-                      facecolor=BG_COLOR, edgecolor=FAIL_COLOR, alpha=0.85)
-        )
-    else:
-        ax.text(
-            0.98, 0.06,
-            "[OK] No anomaly bands detected",  # CHANGED: no emoji
-            transform=ax.transAxes, color=PASS_COLOR,
-            fontsize=10, fontweight="bold", ha="right", va="bottom",
-            bbox=dict(boxstyle="round,pad=0.35",
-                      facecolor=BG_COLOR, edgecolor=PASS_COLOR, alpha=0.85)
-        )
+    # ── Anomaly badge (bottom-right) ──────────────────────────
+    n_anom  = len(anomaly_frames)
+    badge_c = FAIL_COLOR if n_anom > 0 else PASS_COLOR
+    badge_t = (f"[!] {n_anom} anomaly moment(s)  |z| > {ZSCORE_THRESH} sigma"
+               if n_anom > 0 else "[OK] No anomaly moments detected")
+    ax.text(
+        0.98, 0.05, badge_t,
+        transform=ax.transAxes, color=badge_c,
+        fontsize=10, fontweight="bold", ha="right", va="bottom",
+        bbox=dict(boxstyle="round,pad=0.35",
+                  facecolor=BG_COLOR, edgecolor=badge_c, alpha=0.88)
+    )
 
     fig.tight_layout()
-    # ── CHANGED: explicit plt.close prevents memory leak in Gradio ──────────
-    # Gradio renders the figure then we no longer need it in memory.
-    # Without close() repeated calls accumulate figures → eventual crash.
-    plt.close("all")  # CHANGED
+    plt.close("all")   # V3 Update: prevent Gradio memory leak
     return fig
 
 
