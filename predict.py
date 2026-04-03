@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import librosa
 import librosa.display
+from ann_model import predict as ann_predict
 
 from feature_extraction import (
     extract_features, load_audio,
@@ -158,7 +159,7 @@ def compute_weighted_zscore_vote(file_path, importances=None):
         return "PASS", 0.0              # if anything fails, don't penalise
 
 
-def compute_ensemble_status(prob_normal, baseline_risk_level, zscore_vote):
+def compute_ensemble_status(prob_normal, baseline_risk_level, zscore_vote, file_path):
     """
     CHANGED (Task 6 & 10) — Ensemble voting from 3 independent detectors.
 
@@ -202,6 +203,11 @@ def compute_ensemble_status(prob_normal, baseline_risk_level, zscore_vote):
     zscore_v = zscore_vote   # "PASS" / "WARNING" / "FAIL"
 
     votes = [rf_vote, baseline_vote, zscore_v]
+    try:
+        ann_status, _, _ = ann_predict(file_path)
+        votes.append(ann_status)
+    except:
+        pass
     fail_count    = votes.count("FAIL")
     warn_or_worse = fail_count + votes.count("WARNING")
 
@@ -956,3 +962,13 @@ def plot_baseline_comparison(distance, sigma, risk_level):
     ax.grid(axis="x", color=GRID_COLOR, alpha=0.4)
     fig.tight_layout()
     return fig
+if __name__ == "__main__":
+    file_path = r"C:\Users\lenovo\OneDrive\Desktop\Engine detection\Engine_AI\dataset\Noise data\06_42M64435514_Atulya_300_Brake_LI_20241224155345.wav"
+    
+    status, confidence, prediction, prob_normal, prob_abnormal, pass_thr = predict_engine_status(file_path)
+    
+    print(f"File     : {os.path.basename(file_path)}")
+    print(f"Status   : {status}")
+    print(f"Normal   : {prob_normal   * 100:.1f}%")
+    print(f"Abnormal : {prob_abnormal * 100:.1f}%")
+    print(f"Confidence : {confidence:.1f}%")
