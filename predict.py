@@ -31,7 +31,7 @@ from train_model import load_model
 from config import (
     SAMPLE_RATE, HOP_LENGTH, N_FFT,
     BASELINE_PATH, BASELINE_WARN_SIGMA, BASELINE_FAIL_SIGMA,
-    PASS_THRESHOLD, WARN_THRESHOLD,                    # CHANGED — three-zone thresholds
+    PASS_THRESHOLD,                    # CHANGED — three-zone thresholds
     ENSEMBLE_FAIL_VOTES,                               # CHANGED — ensemble voting
     WEIGHT_MFCC, WEIGHT_SPECTRAL, WEIGHT_OTHER         # CHANGED — feature weights
 )
@@ -41,8 +41,7 @@ from config import (
 # COLOUR PALETTE  (consistent across all plots)
 # ────────────────────────────────────────────────────────────
 PASS_COLOR = "#2ECC71"    # green
-FAIL_COLOR = "#E74C3C"    # red
-WARN_COLOR = "#F39C12"    # orange
+FAIL_COLOR = "#E74C3C"    # red  
 WAVE_COLOR = "#3498DB"    # blue
 BG_COLOR   = "#1A1A2E"    # dark navy
 GRID_COLOR = "#2C2C54"
@@ -73,12 +72,10 @@ def load_adaptive_threshold():
     """
     if os.path.exists(THRESHOLD_PATH):
         data           = joblib.load(THRESHOLD_PATH)
-        pass_thr       = float(data["threshold"])
-        # WARNING zone starts at 70% of the PASS threshold
-        warn_thr       = pass_thr * 0.70               # CHANGED — dynamic WARN zone
-        return pass_thr, warn_thr, "adaptive"
+        pass_thr       = float(data["threshold"])               # CHANGED — dynamic WARN zone
+        return pass_thr, "adaptive"
     # Fallback to config defaults
-    return PASS_THRESHOLD, WARN_THRESHOLD, "config_default"
+    return PASS_THRESHOLD,"config_default"
 
 
 def load_feature_importances():
@@ -146,10 +143,8 @@ def compute_weighted_zscore_vote(file_path, importances=None):
         # ── Vote thresholds ────────────────────────────────────
         # These are empirically chosen: a well-normalized healthy engine
         # should have a weighted z-score below 1.5
-        if weighted_score < 1.5:
+        if weighted_score < 2.0:
             vote = "PASS"
-        elif weighted_score < 2.5:
-            vote = "WARNING"
         else:
             vote = "FAIL"
 
@@ -166,7 +161,7 @@ def compute_ensemble_status(prob_normal, baseline_risk_level, zscore_vote, file_
     Detectors
     ---------
     1. RF model      : PASS / WARNING / FAIL  (from prob_normal + adaptive threshold)
-    2. Baseline sigma: OK -> PASS, WARNING -> WARNING, ALERT -> FAIL
+    2. Baseline sigma: OK -> PASS, WARNING -> FAIL, ALERT -> FAIL
     3. Z-score       : PASS / WARNING / FAIL  (from compute_weighted_zscore_vote)
 
     Voting rule (Task 6 Confidence Rule):
@@ -181,22 +176,19 @@ def compute_ensemble_status(prob_normal, baseline_risk_level, zscore_vote, file_
 
     Returns
     -------
-    final_status   : str    "PASS" / "WARNING" / "FAIL"
+    final_status   : str    "PASS"  / "FAIL"
     explanation    : str    Brief reason for the decision
     """
-    pass_thr, warn_thr, _ = load_adaptive_threshold()
+    pass_thr,_ = load_adaptive_threshold()
 
     # ── Detector 1: RF model ───────────────────────────────────
     if prob_normal >= pass_thr:
         rf_vote = "PASS"
-    elif prob_normal >= warn_thr:
-        rf_vote = "WARNING"
     else:
         rf_vote = "FAIL"
 
     # ── Detector 2: Baseline sigma ─────────────────────────────
-    baseline_map = {"OK": "PASS", "WARNING": "WARNING", "ALERT": "FAIL",
-                    "N/A": "PASS"}
+    baseline_map = {"OK": "PASS", "WARNING": "FAIL", "ALERT": "FAIL", "N/A": "PASS"}
     baseline_vote = baseline_map.get(baseline_risk_level, "PASS")
 
     # ── Detector 3: Z-score vote (already computed) ────────────
@@ -209,16 +201,11 @@ def compute_ensemble_status(prob_normal, baseline_risk_level, zscore_vote, file_
     except:
         pass
     fail_count    = votes.count("FAIL")
-    warn_or_worse = fail_count + votes.count("WARNING")
 
     if fail_count >= ENSEMBLE_FAIL_VOTES:          # >= 2 detectors say FAIL
         final_status = "FAIL"
         explanation  = (f"[RF={rf_vote}, Baseline={baseline_vote}, "
                         f"ZScore={zscore_v}] — {fail_count}/3 FAIL votes")
-    elif warn_or_worse >= ENSEMBLE_FAIL_VOTES:     # >= 2 say WARNING or worse
-        final_status = "WARNING"
-        explanation  = (f"[RF={rf_vote}, Baseline={baseline_vote}, "
-                        f"ZScore={zscore_v}] — {warn_or_worse}/3 WARNING+ votes")
     else:                                          # most detectors say PASS
         final_status = "PASS"
         explanation  = (f"[RF={rf_vote}, Baseline={baseline_vote}, "
@@ -233,18 +220,17 @@ def compute_ensemble_status(prob_normal, baseline_risk_level, zscore_vote, file_
 def predict_engine_status(file_path):
     """
     Load the trained model, extract features, apply adaptive threshold,
-    and return PASS / WARNING / FAIL with probabilities.
+    and return PASS / FAIL with probabilities.
 
     CHANGED (Task 1 & 7):
     - Loads adaptive threshold from models/threshold.pkl (falls back to config)
-    - Uses THREE zones: PASS / WARNING / FAIL instead of binary PASS/FAIL
+    - Uses THREE zones: PASS / FAIL instead of binary PASS/FAIL
     - PASS  = Normal Score >= pass_threshold  (adaptive, ~95th pct of training normals)
-    - WARNING = Normal Score >= warn_threshold (70% of pass_threshold)
-    - FAIL  = Normal Score <  warn_threshold
+    - FAIL  = ELSE FALSE
 
     Returns
     -------
-    status        : str    "PASS" / "WARNING" / "FAIL"
+    status        : str    "PASS" / "FAIL"
     confidence    : float  Confidence % (0–100)
     prediction    : int    0=Normal, 1=Abnormal  (raw model vote, unchanged)
     prob_normal   : float  Probability of being normal (0–1)
@@ -263,27 +249,19 @@ def predict_engine_status(file_path):
     prob_abnormal = probabilities[1]
 
     # CHANGED — load adaptive threshold from training data
-    pass_thr, warn_thr, thr_source = load_adaptive_threshold()
+    pass_thr,thr_source = load_adaptive_threshold()
 
     # CHANGED — three-zone decision
     if prob_normal >= pass_thr:
-        status = "PASS"
-    elif prob_normal >= warn_thr:
-        status = "WARNING"                             # CHANGED — new WARNING zone
+        status = "PASS"                      
     else:
         status = "FAIL"
 
     # Confidence = certainty of the actual status
     if status == "PASS":
         confidence = prob_normal * 100
-    elif status == "FAIL":
+    else:
         confidence = prob_abnormal * 100
-    else:                                              # WARNING
-        # How far are we into the warning zone?  0% = bottom, 100% = near pass
-        zone_width  = max(pass_thr - warn_thr, 1e-9)
-        confidence  = ((prob_normal - warn_thr) / zone_width) * 100
-        confidence  = float(np.clip(confidence, 0, 100))
-
     return status, confidence, prediction, prob_normal, prob_abnormal, pass_thr
 
 
@@ -520,7 +498,6 @@ def plot_anomaly_indicators(file_path):
     Colours
     ───────
     🟢 Green  — |z| < BASELINE_WARN_SIGMA   (within normal variation)
-    🟡 Orange — BASELINE_WARN_SIGMA ≤ |z| < BASELINE_FAIL_SIGMA  (warning)
     🔴 Red    — |z| ≥ BASELINE_FAIL_SIGMA   (alert — strong anomaly)
 
     Red dashed threshold lines and 🔴 emoji markers highlight alerts.
@@ -559,13 +536,10 @@ def plot_anomaly_indicators(file_path):
     for z in z_scores:
         if abs(z) >= BASELINE_FAIL_SIGMA:
             bar_colors.append(FAIL_COLOR)          # red alert
-        elif abs(z) >= BASELINE_WARN_SIGMA:
-            bar_colors.append(WARN_COLOR)          # orange warning
         else:
             bar_colors.append(PASS_COLOR)          # green OK
 
     n_alert = bar_colors.count(FAIL_COLOR)
-    n_warn  = bar_colors.count(WARN_COLOR)
 
     x = np.arange(n)
 
@@ -579,9 +553,9 @@ def plot_anomaly_indicators(file_path):
     ax.axhspan(-BASELINE_WARN_SIGMA,  BASELINE_WARN_SIGMA,
                color=PASS_COLOR, alpha=0.05, zorder=0, label="_nolegend_")
     ax.axhspan( BASELINE_WARN_SIGMA,  BASELINE_FAIL_SIGMA,
-               color=WARN_COLOR, alpha=0.07, zorder=0, label="_nolegend_")
+               color=FAIL_COLOR, alpha=0.07, zorder=0, label="_nolegend_")
     ax.axhspan(-BASELINE_FAIL_SIGMA, -BASELINE_WARN_SIGMA,
-               color=WARN_COLOR, alpha=0.07, zorder=0, label="_nolegend_")
+               color=FAIL_COLOR, alpha=0.07, zorder=0, label="_nolegend_")
     ax.axhspan( BASELINE_FAIL_SIGMA,  y_abs_max,
                color=FAIL_COLOR, alpha=0.07, zorder=0, label="_nolegend_")
     ax.axhspan(-y_abs_max, -BASELINE_FAIL_SIGMA,
@@ -592,10 +566,10 @@ def plot_anomaly_indicators(file_path):
            edgecolor="none", zorder=2, alpha=0.90)
 
     # ── Threshold lines ───────────────────────────────────────
-    ax.axhline( BASELINE_WARN_SIGMA,  color=WARN_COLOR, linewidth=1.5,
+    ax.axhline( BASELINE_WARN_SIGMA,  color=FAIL_COLOR, linewidth=1.5,
                 linestyle="--", alpha=0.85, zorder=3,
-                label=f"Warning  ±{BASELINE_WARN_SIGMA}σ")
-    ax.axhline(-BASELINE_WARN_SIGMA,  color=WARN_COLOR, linewidth=1.5,
+                label=f"Warning  ±{BASELINE_FAIL_SIGMA}σ")
+    ax.axhline(-BASELINE_WARN_SIGMA,  color=FAIL_COLOR, linewidth=1.5,
                 linestyle="--", alpha=0.85, zorder=3)
     ax.axhline( BASELINE_FAIL_SIGMA,  color=FAIL_COLOR, linewidth=2.0,
                 linestyle="--", alpha=0.95, zorder=3,
@@ -662,11 +636,10 @@ def plot_anomaly_indicators(file_path):
     )
 
     # ── Summary badge ─────────────────────────────────────────
-    if n_alert > 0 or n_warn > 0:
-        badge_color = FAIL_COLOR if n_alert > 0 else WARN_COLOR
+    if n_alert > 0:
+        badge_color = FAIL_COLOR 
         # CHANGED: plain text badge — no emoji in matplotlib text
-        badge_text  = (f"[ALERT] {n_alert} alerts   [WARN] {n_warn} warnings"
-                       f"   of {n} features")
+        badge_text = (f"[ALERT] {n_alert } alerts of {n} features")
     else:
         badge_color = PASS_COLOR
         badge_text  = f"[OK]  All {n} features within healthy range"  # CHANGED: no emoji
@@ -689,11 +662,8 @@ def plot_anomaly_indicators(file_path):
 # 5.  PLOT: WAVEFORM
 # ────────────────────────────────────────────────────────────
 def plot_waveform(audio, sr, status):
-    # CHANGED — WARNING uses orange colour instead of always red/green
     if status == "PASS":
         color = PASS_COLOR
-    elif status == "WARNING":
-        color = WARN_COLOR                             # CHANGED — orange for WARNING
     else:
         color = FAIL_COLOR
 
@@ -818,12 +788,8 @@ def format_result_text(status, confidence, prob_normal, prob_abnormal,
     # CHANGED — three-zone status icon
     if status == "PASS":
         status_icon = "[PASS]"
-    elif status == "WARNING":
-        status_icon = "[WARNING]"                          # CHANGED
     else:
         status_icon = "[FAIL]"
-
-    warn_thr = pass_threshold * 0.70
 
     lines = [
         "=" * 48,
@@ -837,8 +803,7 @@ def format_result_text(status, confidence, prob_normal, prob_abnormal,
         "-" * 48,
         # CHANGED — show all three thresholds clearly
         f"  PASS  threshold  : >= {pass_threshold*100:.1f}%  (adaptive from training)",
-        f"  WARN  threshold  : >= {warn_thr*100:.1f}%",
-        f"  FAIL  threshold  : <  {warn_thr*100:.1f}%",
+        f"  FAIL  threshold  : <  {pass_threshold*100:.1f}%",
         "-" * 48,
     ]
 
@@ -850,11 +815,6 @@ def format_result_text(status, confidence, prob_normal, prob_abnormal,
     if status == "PASS":
         lines.append("  Result : No acoustic anomaly detected.")
         lines.append("           Engine sounds within normal range.")
-    elif status == "WARNING":                              # CHANGED — WARNING zone
-        gap = pass_threshold * 100 - prob_normal * 100
-        lines.append("  Result : BORDERLINE — engine sound is within")
-        lines.append(f"           the WARNING zone ({gap:.1f}% below PASS).")
-        lines.append("           Re-test recommended before final decision.")
     else:
         lines.append("  Result : ABNORMAL acoustic signature detected!")
         lines.append("           Engine requires immediate inspection.")
@@ -891,8 +851,6 @@ def compute_baseline_distance(file_path):
 
     if sigma < BASELINE_WARN_SIGMA:
         risk_level = "OK"
-    elif sigma < BASELINE_FAIL_SIGMA:
-        risk_level = "WARNING"
     else:
         risk_level = "ALERT"
 
@@ -902,7 +860,7 @@ def compute_baseline_distance(file_path):
 
 
 def _format_baseline_report(distance, sigma, risk_level, intra_mean, intra_std, n_samples):
-    icon_map = {"OK": "[OK]", "WARNING": "[WARN]", "ALERT": "[ALERT]"}
+    icon_map = {"OK": "[OK]", "WARNING": "[ALERT]", "ALERT": "[ALERT]"}
     icon     = icon_map.get(risk_level, "?")
     lines = [
         "-" * 45,
@@ -919,9 +877,6 @@ def _format_baseline_report(distance, sigma, risk_level, intra_mean, intra_std, 
     ]
     if risk_level == "OK":
         lines.append("  Interpretation : Sound signature is CLOSE to the baseline.")
-    elif risk_level == "WARNING":
-        lines.append("  Interpretation : Sound signature NOTICEABLY different.")
-        lines.append("                   Recommend re-inspection.")
     else:
         lines.append("  Interpretation : Sound STRONGLY DEVIATES from baseline.")
         lines.append("                   Immediate inspection advised.")
@@ -936,19 +891,17 @@ def plot_baseline_comparison(distance, sigma, risk_level):
     ax.set_facecolor(BG_COLOR)
     ax.barh([0], [BASELINE_WARN_SIGMA], color=PASS_COLOR, height=0.5, alpha=0.35, left=0)
     ax.barh([0], [BASELINE_FAIL_SIGMA - BASELINE_WARN_SIGMA],
-            color=WARN_COLOR, height=0.5, alpha=0.35, left=BASELINE_WARN_SIGMA)
+            color=FAIL_COLOR, height=0.5, alpha=0.35, left=BASELINE_WARN_SIGMA)
     ax.barh([0], [max(sigma + 2, BASELINE_FAIL_SIGMA + 2) - BASELINE_FAIL_SIGMA],
             color=FAIL_COLOR, height=0.5, alpha=0.25, left=BASELINE_FAIL_SIGMA)
     display_sigma = max(sigma, 0.05)
-    color_map     = {"OK": PASS_COLOR, "WARNING": WARN_COLOR, "ALERT": FAIL_COLOR}
+    color_map     = {"OK": PASS_COLOR, "WARNING": FAIL_COLOR, "ALERT": FAIL_COLOR}
     marker_color  = color_map.get(risk_level, TEXT_COLOR)
     ax.axvline(display_sigma, color=marker_color, linewidth=3, zorder=5)
     ax.text(display_sigma, 0.32, f"sigma={sigma:+.2f}",
             color=marker_color, fontsize=11, fontweight="bold", ha="center", va="bottom")
     ax.text(BASELINE_WARN_SIGMA / 2,                          -0.32, "OK",      color=PASS_COLOR, ha="center", fontsize=9)
-    ax.text((BASELINE_WARN_SIGMA + BASELINE_FAIL_SIGMA) / 2,  -0.32, "WARNING", color=WARN_COLOR, ha="center", fontsize=9)
     ax.text(BASELINE_FAIL_SIGMA + 1,                          -0.32, "ALERT",   color=FAIL_COLOR, ha="center", fontsize=9)
-    ax.axvline(BASELINE_WARN_SIGMA, color=WARN_COLOR, linewidth=1, linestyle="--", alpha=0.7)
     ax.axvline(BASELINE_FAIL_SIGMA, color=FAIL_COLOR, linewidth=1, linestyle="--", alpha=0.7)
     max_x = max(sigma + 1.5, BASELINE_FAIL_SIGMA + 2)
     ax.set_xlim(0, max_x)
@@ -963,7 +916,7 @@ def plot_baseline_comparison(distance, sigma, risk_level):
     fig.tight_layout()
     return fig
 if __name__ == "__main__":
-    file_path = r"C:\Users\lenovo\OneDrive\Desktop\Engine detection\Engine_AI\dataset\Noise data\06_42M64435514_Atulya_300_Brake_LI_20241224155345.wav"
+    file_path = r"C:\Users\lenovo\OneDrive\Desktop\Engine detection\Engine_AI\dataset\Noise data\06_64421720_Atulya_300_Brake_LI_20241105174630.wav"
     
     status, confidence, prediction, prob_normal, prob_abnormal, pass_thr = predict_engine_status(file_path)
     
