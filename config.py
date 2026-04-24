@@ -38,7 +38,6 @@ N_ESTIMATORS  = 200     # Number of trees in Random Forest
 # ── Task 7: Three-zone Gray Zone decision thresholds ─────────
 # Instead of binary PASS/FAIL we now use three zones:
 #   PASS    — Normal Score >= PASS_THRESHOLD  (engine is healthy)
-#   WARNING — Normal Score >= WARN_THRESHOLD  (borderline, re-test advised)
 #   FAIL    — Normal Score <  WARN_THRESHOLD  (engine has a problem)
 #
 # IMPORTANT: run_training() auto-calculates an adaptive PASS_THRESHOLD
@@ -46,7 +45,7 @@ N_ESTIMATORS  = 200     # Number of trees in Random Forest
 # That file takes priority over this hardcoded value.
 # These values are only used as a fallback when threshold.pkl is missing.
 PASS_THRESHOLD  = 0.65   # CHANGED — was 0.90 (too strict for small datasets)
-WARN_THRESHOLD  = 0.45   # CHANGED — new: bottom of WARNING zone
+# WARN_THRESHOLD  = 0.45   # CHANGED — new: bottom of WARNING zone
 
 # ── Task 4: Frequency Band Filtering ─────────────────────────
 # Engine fundamental frequencies are concentrated in 500–2000 Hz.

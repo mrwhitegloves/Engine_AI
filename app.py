@@ -19,7 +19,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import gradio as gr
+
 from scipy import signal as scipy_signal
 from scipy.fft import fft, fftfreq
 from scipy import stats as scipy_stats
@@ -30,15 +30,13 @@ from predict import (
     format_result_text,
     compute_baseline_distance,
     plot_baseline_comparison,
-    plot_worm_graph,
     plot_anomaly_indicators,
     compute_ensemble_status,
     compute_weighted_zscore_vote,
     load_feature_importances,
+    get_anomaly_raw_data,
 )
 from config import BASELINE_PATH, BASELINE_PLOT, NORMAL_DIR
-
-logo_path = os.path.abspath("ForBlack.png")
 
 # ── shared plot style ─────────────────────────────────────────
 BG   = "#1A1A2E"
@@ -79,19 +77,19 @@ def analyze_engine_audio(audio_file):
         return ("Please upload an engine audio file first.",
                 None, None, None, None,
                 "Upload a file to see baseline comparison.",
-                None, None, None)
+                None, None)
 
     if not check_model_ready():
         msg = ("RF Model not found!\n\nPlease train first:\n"
                "   python train_model.py\n\nThen restart this app.")
-        return msg, None, None, None, None, "RF model not ready.", None, None, None
+        return msg, None, None, None, None, "RF model not ready.", None, None
 
     try:
         status, confidence, prediction, prob_normal, prob_abnormal, pass_threshold = \
             predict_engine_status(audio_file)
     except Exception as err:
         return (f"Classifier error:\n{err}",
-                None, None, None, None, "Classifier failed.", None, None, None)
+                None, None, None, None, "Classifier failed.", None, None)
 
     risk_level     = "N/A"
     baseline_text  = ""
@@ -123,6 +121,9 @@ def analyze_engine_audio(audio_file):
         final_status         = status
         ensemble_explanation = "(ensemble error, using RF only)"
 
+    print("final_status", final_status)
+    print("ensemble_explanation", ensemble_explanation)
+
     rf_text = format_result_text(final_status, confidence,
                                   prob_normal, prob_abnormal,
                                   pass_threshold, ensemble_explanation)
@@ -133,19 +134,19 @@ def analyze_engine_audio(audio_file):
     except Exception:
         waveform_fig = spectrogram_fig = mel_fig = gauge_fig = None
 
-    worm_fig = anomaly_fig = None
+    anomaly_fig = None
     if check_baseline_ready():
-        try:
-            worm_fig = plot_worm_graph(audio_file)
-        except Exception:
-            worm_fig = None
         try:
             anomaly_fig = plot_anomaly_indicators(audio_file)
         except Exception:
             anomaly_fig = None
 
     return (rf_text, waveform_fig, spectrogram_fig, mel_fig, gauge_fig,
-            baseline_text, baseline_gauge, worm_fig, anomaly_fig)
+            baseline_text, baseline_gauge, anomaly_fig,
+            prob_normal, prob_abnormal, float(pass_threshold),
+            distance if 'distance' in locals() else 0.0,
+            sigma if 'sigma' in locals() else 0.0,
+            get_anomaly_raw_data(audio_file))
 
 
 # ════════════════════════════════════════════════════════════
@@ -584,7 +585,7 @@ def analyse_all_files(files):
     df, waveform_dict, status_msg = process_multi_files(files)
 
     if df is None:
-        empty = [None] * 18                # NEW — 18 outputs now (added metadata_table)
+        empty = [None] * 19
         empty[0] = status_msg
         return tuple(empty)
 
@@ -625,7 +626,7 @@ def analyse_all_files(files):
         bar_figs[1],  # Duration chart
         bar_figs[2],  # Peak Freq chart
         bar_figs[3],  # ZCR chart
-        gr.Dropdown(choices=filenames, value=filenames[0] if filenames else None),
+        filenames,
         pie_fig,
         box_figs[0] if len(box_figs) > 0 else None,
         box_figs[1] if len(box_figs) > 1 else None,
@@ -725,19 +726,19 @@ def load_files_from_folder(folder_path):
     from pathlib import Path
 
     if not folder_path or not folder_path.strip():
-        empty = [None] * 18
+        empty = [None] * 19
         empty[0] = "Enter a folder path and click Load Folder."
         return tuple(empty)
 
     folder_path = folder_path.strip()
     if not os.path.isdir(folder_path):
-        empty = [None] * 18
+        empty = [None] * 19
         empty[0] = f"Folder not found: {folder_path}"
         return tuple(empty)
 
     wav_files = list(Path(folder_path).glob("*.wav"))
     if not wav_files:
-        empty = [None] * 18
+        empty = [None] * 19
         empty[0] = f"No .wav files found in: {folder_path}"
         return tuple(empty)
 
@@ -867,520 +868,321 @@ def make_anomaly_detail_text(files_state):
 
 
 # ════════════════════════════════════════════════════════════
-# BUILD THE GRADIO UI
+# FLASK REST API
 # ════════════════════════════════════════════════════════════
 
-def build_ui():
-    """Construct and return the full Gradio Blocks application."""
+import base64
+import json
+import io
+import tempfile
+from flask import Flask, request, jsonify, Response, send_from_directory
+from flask_cors import CORS
 
-    with gr.Blocks(
-        title = "Engine Acoustic Diagnostic AI",
-        theme = gr.themes.Base(
-            primary_hue   = "blue",
-            secondary_hue = "slate",
-            font          = [gr.themes.GoogleFont("Inter"), "sans-serif"]
-        ),
-        css = """
-            .mono textarea { font-family: monospace !important; font-size: 13px !important; }
-            .big-btn { font-size: 16px !important; }
-            .stat-table { font-size: 12px !important; }
-        """
-    ) as app:
-        
-        with gr.Row():
-                gr.Markdown("""
-        # Engine Acoustic Intelligence System
-        **Three-layer analysis: RF Classifier · Acoustic Baseline · Multi-File Statistics**
-        """)
+# Point Flask to the React build folder
+FRONTEND_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
 
-        # ════════════════════════════════════════════════════
-        # TAB 1 — ENGINE DIAGNOSIS  (unchanged)
-        # ════════════════════════════════════════════════════
-        with gr.Tab("Engine Diagnosis"):
+flask_app = Flask(
+    __name__, 
+    static_folder=FRONTEND_DIST,
+    static_url_path="",
+    template_folder=FRONTEND_DIST
+)
+CORS(flask_app)
 
-            if not check_model_ready():
-                gr.Markdown("> RF Model not trained. Run `python train_model.py`, then restart.")
-            if not check_baseline_ready():
-                gr.Markdown("> No baseline built yet. Use the Baseline Builder tab.")
 
-            with gr.Row():
-                with gr.Column(scale=1, min_width=260):
-                    gr.Markdown("### Upload Audio")
-                    audio_input = gr.Audio(
-                        type="filepath", label="Engine Recording (.wav / .mp3)",
-                        sources=["upload", "microphone"])
-                    analyze_btn = gr.Button("Analyze Engine", variant="primary",
-                                            size="lg", elem_classes=["big-btn"])
-                    gr.Markdown("**Supported:** WAV, MP3, FLAC, OGG  \n**Ideal:** 10s, 600-750 RPM")
+# ── Global error handlers (always return JSON, never HTML) ────
 
-                with gr.Column(scale=2):
-                    gr.Markdown("### Classifier Report (Random Forest)")
-                    rf_result_output = gr.Textbox(
-                        label="Engine Status", lines=12, max_lines=14,
-                        elem_classes=["mono"],
-                        placeholder="Upload an audio file and click Analyze...")
+@flask_app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Route not found", "detail": str(e)}), 404
 
-            gr.Markdown("### Classifier Confidence")
-            gauge_output = gr.Plot(label="Normal vs Abnormal Probability")
-            gr.Markdown("---")
-            gr.Markdown("### Baseline Comparison (Acoustic Fingerprint Distance)")
+@flask_app.errorhandler(500)
+def internal_error(e):
+    import traceback
+    traceback.print_exc()
+    return jsonify({"error": "Internal server error", "detail": str(e)}), 500
 
-            with gr.Row():
-                with gr.Column(scale=2):
-                    baseline_text_output = gr.Textbox(
-                        label="Baseline Distance Report", lines=12, max_lines=14,
-                        elem_classes=["mono"],
-                        placeholder="Baseline comparison will appear here...")
-                with gr.Column(scale=3):
-                    baseline_gauge_output = gr.Plot(label="Distance from Healthy Baseline")
+@flask_app.errorhandler(Exception)
+def unhandled_exception(e):
+    import traceback
+    traceback.print_exc()
+    return jsonify({"error": str(e)}), 500
 
-            gr.Markdown("---")
-            gr.Markdown("### Worm Graph — Cumulative Mel-Band Energy Comparison")
-            worm_graph_output = gr.Plot(label="Worm Graph (Baseline vs Current Engine)")
-            gr.Markdown("---")
-            gr.Markdown("### Anomaly Indicators — Per-Feature Deviation")
-            anomaly_output = gr.Plot(label="Anomaly Indicators (41 features, z-score coloured)")
-            gr.Markdown("---")
-            gr.Markdown("### Audio Visual Analysis")
-            with gr.Row():
-                waveform_output    = gr.Plot(label="Sound Waveform")
-                spectrogram_output = gr.Plot(label="Frequency Spectrogram")
-            mel_output = gr.Plot(label="Mel Spectrogram")
 
-            analyze_btn.click(
-                fn=analyze_engine_audio, inputs=[audio_input],
-                outputs=[rf_result_output, waveform_output, spectrogram_output,
-                         mel_output, gauge_output, baseline_text_output,
-                         baseline_gauge_output, worm_graph_output, anomaly_output])
+# ── Serialisation helpers ─────────────────────────────────────
 
-        # ════════════════════════════════════════════════════
-        # TAB 2 — BASELINE BUILDER  (unchanged)
-        # ════════════════════════════════════════════════════
-        with gr.Tab("Baseline Builder"):
+def fig_to_b64(fig):
+    """Convert a matplotlib Figure to a base64-encoded PNG string."""
+    if fig is None:
+        return None
+    buf = io.BytesIO()
+    try:
+        fig.savefig(buf, format="png", dpi=110, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+    except Exception:
+        fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    buf.seek(0)
+    encoded = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close(fig)
+    return encoded
 
-            gr.Markdown("""
-            ## Build Acoustic Baseline
-            Reads all `.wav` files from `dataset/normal/` and computes the
-            **mean acoustic fingerprint** of a healthy engine.
-            The result is stored in `models/baseline.pkl` and used automatically in Tab 1.
-            """)
 
-            with gr.Row():
-                baseline_status_label = gr.Textbox(
-                    value=get_baseline_status_text(), label="Current Baseline Status",
-                    interactive=False, elem_classes=["mono"])
-                refresh_btn = gr.Button("Refresh Status", size="sm")
+def df_to_records(df):
+    """Convert a DataFrame to a JSON-safe list of record dicts."""
+    if df is None:
+        return []
+    if hasattr(df, "empty") and df.empty:
+        return []
+    return json.loads(df.where(pd.notnull(df), None).to_json(orient="records"))
 
-            # NEW — two ways to build baseline: upload files OR use folder
-            gr.Markdown("### Option A — Upload .wav files directly")
-            gr.Markdown(
-                "*Select multiple healthy engine recordings. "
-                "They will be copied to `dataset/normal/` and the baseline will be built automatically.*"
-            )
-            baseline_upload = gr.File(                     # NEW
-                label      = "Upload Healthy Engine .wav Files",
-                file_count = "multiple",
-                file_types = [".wav"],
-            )
-            upload_build_btn = gr.Button(                  # NEW
-                "Build Baseline from Uploaded Files",
-                variant      = "primary",
-                size         = "lg",
-                elem_classes = ["big-btn"],
-            )
 
-            gr.Markdown("### Option B — Use files already in `dataset/normal/`")
-            with gr.Row():
-                with gr.Column(scale=1):
-                    build_btn = gr.Button("Build Baseline from dataset/normal/",
-                                          variant="secondary", size="lg",
-                                          elem_classes=["big-btn"])
-                    gr.Markdown("""
-                    **Before clicking Option B:**
-                    - Add `.wav` files to `dataset/normal/`
-                    - Aim for 10+ healthy recordings
+def img_path_to_b64(path):
+    """Read an image file from disk and return base64 string."""
+    if not path or not os.path.exists(str(path)):
+        return None
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
-                    **Files saved either way:**
-                    - `models/baseline.pkl`
-                    - `models/baseline_features.csv`
-                    - `models/avg_spectrogram.png`
-                    """)
-                with gr.Column(scale=2):
-                    build_log_output = gr.Textbox(
-                        label="Build Log", lines=15, max_lines=20,
-                        elem_classes=["mono"],
-                        placeholder="Click either Build button to start...")
 
-            gr.Markdown("### Average Spectrogram of Healthy Engine Baseline")
-            spectrogram_image = gr.Image(
-                value=BASELINE_PLOT if os.path.exists(BASELINE_PLOT) else None,
-                label="Average Mel-Spectrogram", type="filepath", height=380)
+def save_upload(file_obj):
+    """Save a Flask uploaded file to a local temp path preserving the original name."""
+    import uuid
+    # Use a project-local temp directory (D: drive) instead of system temp (C: drive)
+    # since the C: drive is completely out of space (Errno 28).
+    local_tmp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp_uploads")
+    os.makedirs(local_tmp_dir, exist_ok=True)
+    
+    safe_name = f"{uuid.uuid4().hex[:8]}_{file_obj.filename}"
+    real_path = os.path.join(local_tmp_dir, safe_name)
+    
+    file_obj.save(real_path)
+    return real_path
 
-            # Wire Option A (upload files → build)                # NEW
-            upload_build_btn.click(                               # NEW
-                fn      = build_baseline_from_uploads,           # NEW
-                inputs  = [baseline_upload, build_log_output],   # NEW
-                outputs = [build_log_output, baseline_status_label, spectrogram_image],  # NEW
-            )                                                     # NEW
-            # Wire Option B (folder → build)
-            build_btn.click(fn=run_baseline_build, inputs=[],
-                            outputs=[build_log_output, baseline_status_label, spectrogram_image])
-            refresh_btn.click(fn=reload_baseline_status, inputs=[],
-                              outputs=[baseline_status_label, spectrogram_image])
 
-        # ════════════════════════════════════════════════════
-        # TAB 3 — MULTI-FILE AUDIO ANALYSIS  (ALL NEW)
-        # ════════════════════════════════════════════════════
-        with gr.Tab("Multi-File Analysis"):
+# ── Routes ───────────────────────────────────────────────────
 
-            gr.Markdown("""
-            ## WAV Audio Analysis Dashboard
-            Upload multiple engine WAV files to get statistical comparisons, frequency
-            analysis, spectrograms, group comparison, and anomaly detection — just like
-            the standalone Streamlit dashboard, but integrated directly into this app.
+@flask_app.route("/")
+def index():
+    if os.path.exists(os.path.join(FRONTEND_DIST, "index.html")):
+        return send_from_directory(FRONTEND_DIST, "index.html")
+    return jsonify({"error": "React frontend not built yet. Run 'npm run build' in the frontend folder."})
 
-            **How files are classified:**
-            Files whose names contain `abnormal / damper / defective / cam / valvelash /
-            bad / fault / fail / noise / knock` are labelled **Bad Signals**.
-            All others are labelled **Good Signals**.
-            """)
+@flask_app.route("/<path:path>")
+def serve_static(path):
+    # Serve static assets if they exist
+    if os.path.exists(os.path.join(FRONTEND_DIST, path)):
+        return send_from_directory(FRONTEND_DIST, path)
+    # Default to index.html for React routing
+    return send_from_directory(FRONTEND_DIST, "index.html")
 
-            # ── Input Method: Upload OR Folder Path ──────────
-            gr.Markdown("### Input Method")
-            with gr.Row():
-                with gr.Column(scale=1):
-                    gr.Markdown("**Option A — Upload files directly**")
-                    multi_upload = gr.File(
-                        label       = "Upload WAV Files (select multiple)",
-                        file_count  = "multiple",
-                        file_types  = [".wav"],
-                    )
-                    analyse_all_btn = gr.Button(
-                        "Analyse Uploaded Files",
-                        variant      = "primary",
-                        size         = "lg",
-                        elem_classes = ["big-btn"],
-                    )
 
-                with gr.Column(scale=1):
-                    gr.Markdown("**Option B — Load from folder path**")        # NEW
-                    folder_path_input = gr.Textbox(                             # NEW
-                        label       = "Folder path containing .wav files",
-                        placeholder = r"e.g.  C:\Users\you\engine_sounds",  # NEW
-                        lines       = 1,
-                    )
-                    load_folder_btn = gr.Button(                                # NEW
-                        "Load Folder & Analyse",
-                        variant      = "secondary",
-                        size         = "lg",
-                        elem_classes = ["big-btn"],
-                    )
-                    gr.Markdown("""
-                    **Tips:**
-                    - Select all files at once (Ctrl+click or Shift+click)
-                    - Only `.wav` files are supported
-                    - Files are auto-classified by filename keywords
-                    """)
+@flask_app.route("/api/status")
+def api_status():
+    return jsonify({
+        "model_ready":     check_model_ready(),
+        "baseline_ready":  check_baseline_ready(),
+        "baseline_status": get_baseline_status_text(),
+    })
 
-            with gr.Row():
-                with gr.Column(scale=2):
-                    multi_status = gr.Textbox(
-                        label       = "Status",
-                        lines       = 3,
-                        interactive = False,
-                        placeholder = "Upload files or enter folder path and click Analyse...",
-                    )
-                    # Stats table shown immediately after analysis
-                    multi_stats_df = gr.DataFrame(
-                        label             = "Statistical Summary (all files)",
-                        elem_classes      = ["stat-table"],
-                        wrap              = True,
-                        max_height        = 300,
-                    )
-                    stats_download_btn = gr.Button("Download Statistics CSV", size="sm")
 
-            # ── SECTION 1: Overview Bar Charts ────────────────
-            gr.Markdown("---")
-            gr.Markdown("### Overview Statistics")
+@flask_app.route("/api/diagnose", methods=["POST"])
+def api_diagnose():
+    if "audio" not in request.files:
+        return jsonify({"error": "No audio file uploaded."}), 400
 
-            with gr.Row():
-                rms_chart      = gr.Plot(label="RMS Amplitude by File")
-                duration_chart = gr.Plot(label="Duration (s) by File")
-            with gr.Row():
-                peakfreq_chart = gr.Plot(label="Peak Frequency (Hz) by File")
-                zcr_chart      = gr.Plot(label="Zero Crossings by File")
+    tmp_path = save_upload(request.files["audio"])
+    try:
+        (rf_text, waveform_fig, spectrogram_fig, mel_fig, gauge_fig,
+         baseline_text, baseline_gauge, anomaly_fig,
+         prob_normal, prob_abnormal, pass_threshold,
+         distance, sigma, anomaly_data) = analyze_engine_audio(tmp_path)
+        return jsonify({
+            "rf_text":        rf_text,
+            "baseline_text":  baseline_text,
+            "waveform":       fig_to_b64(waveform_fig),
+            "spectrogram":    fig_to_b64(spectrogram_fig),
+            "mel":            fig_to_b64(mel_fig),
+            "gauge":          fig_to_b64(gauge_fig),
+            "baseline_gauge": fig_to_b64(baseline_gauge),
+            "anomaly":        fig_to_b64(anomaly_fig),
+            "prob_normal":    float(prob_normal),
+            "prob_abnormal":  float(prob_abnormal),
+            "pass_threshold": float(pass_threshold),
+            "distance":       float(distance),
+            "sigma":          float(sigma),
+            "anomaly_data":   anomaly_data,
+        })
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
-            # ── SECTION 2: Waveform Viewer ────────────────────
-            gr.Markdown("---")
-            gr.Markdown("### Waveform Viewer")
 
-            waveform_file_dropdown = gr.Dropdown(
-                label   = "Select file to view waveform",
-                choices = [],
-            )
-            waveform_plot = gr.Plot(label="Waveform (full)")
+@flask_app.route("/api/baseline/status")
+def api_baseline_status():
+    status, img_path = reload_baseline_status()
+    return jsonify({
+        "status": status,
+        "image":  img_path_to_b64(img_path),
+    })
 
-            # NEW — zoom controls (mirrors Streamlit time-range sliders)
-            gr.Markdown("**Zoom to time range:**")             # NEW
-            with gr.Row():                                      # NEW
-                zoom_start = gr.Slider(                         # NEW
-                    label="Start time (s)", minimum=0, maximum=30,
-                    value=0, step=0.1)
-                zoom_end   = gr.Slider(                         # NEW
-                    label="End time (s)",   minimum=0, maximum=30,
-                    value=5, step=0.1)
-            zoomed_waveform_plot = gr.Plot(label="Zoomed Waveform")  # NEW
 
-            # # ── SECTION 3: Frequency Analysis (FFT) ──────────
-            # gr.Markdown("---")
-            # gr.Markdown("### Frequency Analysis (FFT)")
+@flask_app.route("/api/baseline/build-folder", methods=["POST"])
+def api_baseline_build_folder():
+    def generate():
+        for log, status, img_path in run_baseline_build():
+            data = json.dumps({
+                "log":    log,
+                "status": status,
+                "image":  img_path_to_b64(img_path),
+            })
+            yield f"data: {data}\n\n"
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
-            # fft_file_dropdown = gr.Dropdown(
-            #     label   = "Select file for FFT",
-            #     choices = [],
-            # )
-            # freq_limit_slider = gr.Slider(
-            #     label   = "Frequency limit (Hz)",
-            #     minimum = 100,
-            #     maximum = 20000,
-            #     value   = 5000,
-            #     step    = 100,
-            # )
-            # fft_plot = gr.Plot(label="FFT Spectrum")
 
-            # # ── SECTION 4: Spectrogram ────────────────────────
-            # gr.Markdown("---")
-            # gr.Markdown("### Spectrogram Analysis")
+@flask_app.route("/api/baseline/build-upload", methods=["POST"])
+def api_baseline_build_upload():
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"error": "No files uploaded."}), 400
 
-            # spec_file_dropdown = gr.Dropdown(
-            #     label   = "Select file for spectrogram",
-            #     choices = [],
-            # )
-            # spectrogram_plot = gr.Plot(label="Spectrogram (dB)")
+    tmp_paths = [save_upload(f) for f in files]
 
-            # ── SECTION 5: Group Comparison ───────────────────
-            gr.Markdown("---")
-            gr.Markdown("### Group Comparison (Good Signals vs Bad Signals)")
+    def generate():
+        try:
+            for log, status, img_path in build_baseline_from_uploads(tmp_paths, ""):
+                data = json.dumps({
+                    "log":    log,
+                    "status": status,
+                    "image":  img_path_to_b64(img_path),
+                })
+                yield f"data: {data}\n\n"
+        finally:
+            for p in tmp_paths:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
 
-            with gr.Row():
-                pie_chart    = gr.Plot(label="Group Distribution")
-                box_rms      = gr.Plot(label="RMS Distribution")
-            with gr.Row():
-                box_pf       = gr.Plot(label="Peak Frequency Distribution")
-                box_zcr      = gr.Plot(label="Zero Crossings Distribution")
-            with gr.Row():
-                box_energy   = gr.Plot(label="Energy Distribution")
-                box_cf       = gr.Plot(label="Crest Factor Distribution")
-            box_dur          = gr.Plot(label="Duration Distribution")
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
-            # ── SECTION 6: Anomaly Detection ──────────────────
-            gr.Markdown("---")
-            gr.Markdown("""
-            ### Anomaly Detection
-            *Thresholds are computed from Good Signals (mean ± 2 std).
-            Any file outside this range for a given metric is flagged as anomalous.*
-            """)
 
-            # NEW — anomaly count metrics (mirrors Streamlit metric boxes)
-            gr.Markdown("**Anomaly Summary:**")                # NEW
-            with gr.Row():                                      # NEW
-                metric_total     = gr.Textbox(label="Total Files",      interactive=False, lines=1)  # NEW
-                metric_anomalous = gr.Textbox(label="Anomalous Files",  interactive=False, lines=1)  # NEW
-                metric_rate      = gr.Textbox(label="Anomaly Rate (%)", interactive=False, lines=1)  # NEW
+@flask_app.route("/api/multi/analyse", methods=["POST"])
+def api_multi_analyse():
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"error": "No files uploaded."}), 400
 
-            anomaly_summary_df = gr.DataFrame(
-                label        = "Anomaly Detection Results (per file)",
-                max_height   = 300,
-            )
-            anomaly_scatter    = gr.Plot(label="Anomaly Scatter: RMS vs Peak Frequency")
+    tmp_paths = [save_upload(f) for f in files]
+    try:
+        results = analyse_all_files(tmp_paths)
+        return _package_multi_results(results)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Analysis failed: {e}"}), 500
+    finally:
+        for p in tmp_paths:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
-            # NEW — per-file detailed anomaly breakdown (mirrors Streamlit expanders)
-            gr.Markdown("**Detailed Anomaly Breakdown** *(files outside mean ± 2std for any metric):*")  # NEW
-            anomaly_detail_text = gr.Textbox(                  # NEW
-                label       = "Per-File Anomaly Details",
-                lines       = 12,
-                max_lines   = 20,
-                interactive = False,
-                elem_classes= ["mono"],
-                placeholder = "Run analysis to see per-file anomaly detail...",
-            )
 
-            ttest_df_output    = gr.DataFrame(
-                label        = "T-Test Significance Table (Good vs Bad Signals)",
-                max_height   = 260,
-            )
-            significance_msg   = gr.Textbox(
-                label       = "Significance Summary",
-                lines       = 2,
-                interactive = False,
-            )
+@flask_app.route("/api/multi/analyse-folder", methods=["POST"])
+def api_multi_analyse_folder():
+    body   = request.get_json(silent=True) or {}
+    folder = body.get("folder", "").strip()
+    if not folder:
+        return jsonify({"error": "No folder path provided."}), 400
+    try:
+        results = load_files_from_folder(folder)
+        return _package_multi_results(results)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Analysis failed: {e}"}), 500
 
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("**Bad Signals (Anomalies)**")
-                    bad_files_list = gr.Textbox(
-                        label="Files classified as Bad Signals",
-                        lines=8, interactive=False)
-                with gr.Column():
-                    gr.Markdown("**Good Signals (Normal)**")
-                    good_files_list = gr.Textbox(
-                        label="Files classified as Good Signals",
-                        lines=8, interactive=False)
 
-            # NEW — Metadata Analysis section (mirrors Streamlit Tab 5)
-            gr.Markdown("---")                                 # NEW
-            gr.Markdown("### Metadata Analysis (Filename Parts)")  # NEW
-            gr.Markdown(                                        # NEW
-                "*Each filename is split on underscores. "
-                "Part_1, Part_2, ... show the individual tokens "
-                "so you can identify engine type, serial number, date, etc.*"
-            )
-            metadata_table_output = gr.DataFrame(              # NEW
-                label      = "Filename Metadata (underscore-split)",
-                max_height = 350,
-            )
+def _package_multi_results(results):
+    """Serialise the 19-tuple from analyse_all_files / load_files_from_folder."""
+    try:
+        if len(results) < 19:
+            return jsonify({"error": f"Unexpected result length {len(results)}"}), 500
 
-            # ── Wire: Analyse All Files button ────────────────
-            analyse_outputs = [
-                multi_status,          # 1
-                multi_stats_df,        # 2
-                rms_chart,             # 3
-                duration_chart,        # 4
-                peakfreq_chart,        # 5
-                zcr_chart,             # 6
-                waveform_file_dropdown,# 7  (gr.Dropdown update)
-                pie_chart,             # 8
-                box_rms,               # 9
-                box_pf,                # 10
-                box_zcr,               # 11
-                box_energy,            # 12
-                box_cf,                # 13
-                box_dur,               # 14
-                anomaly_summary_df,    # 15
-                anomaly_scatter,       # 16
-                ttest_df_output,       # 17
-                significance_msg,      # 18
-                metadata_table_output, # 19 NEW
-            ]
+        (status_msg, stats_df, rms_fig, dur_fig, peakfreq_fig, zcr_fig,
+         filenames, pie_fig, box_rms, box_pf, box_zcr, box_energy, box_cf,
+         box_dur, anomaly_df, scatter_fig, t_test_df, sig_msg,
+         metadata_df) = results
 
-            def analyse_and_update_dropdowns(files):
-                """
-                Wrapper that calls analyse_all_files and also populates
-                the FFT and Spectrogram dropdowns (which aren't in the
-                main return list to keep things clean).
-                """
-                results = analyse_all_files(files)
-                # results[6] is the gr.Dropdown update for waveform_file_dropdown
-                return results
+        anom_total, anom_count, anom_rate = get_anomaly_metrics(
+            pd.DataFrame(df_to_records(anomaly_df)) if anomaly_df is not None else None
+        )
 
-            analyse_all_btn.click(
-                fn      = analyse_and_update_dropdowns,
-                inputs  = [multi_upload],
-                outputs = analyse_outputs,
-            )
+        return jsonify({
+            "status":          status_msg,
+            "stats":           df_to_records(stats_df),
+            "filenames":       filenames if isinstance(filenames, list) else [],
+            "rms_chart":       fig_to_b64(rms_fig),
+            "dur_chart":       fig_to_b64(dur_fig),
+            "pf_chart":        fig_to_b64(peakfreq_fig),
+            "zcr_chart":       fig_to_b64(zcr_fig),
+            "pie_chart":       fig_to_b64(pie_fig),
+            "box_rms":         fig_to_b64(box_rms),
+            "box_pf":          fig_to_b64(box_pf),
+            "box_zcr":         fig_to_b64(box_zcr),
+            "box_energy":      fig_to_b64(box_energy),
+            "box_cf":          fig_to_b64(box_cf),
+            "box_dur":         fig_to_b64(box_dur),
+            "anomaly":         df_to_records(anomaly_df),
+            "scatter":         fig_to_b64(scatter_fig),
+            "ttest":           df_to_records(t_test_df),
+            "sig_msg":         sig_msg,
+            "metadata":        df_to_records(metadata_df),
+            "anomaly_detail":  make_anomaly_detail_text(None),
+            "anomaly_metrics": [anom_total, anom_count, anom_rate],
+        })
 
-            # ── After analysis, sync the FFT and spectrogram dropdowns ──
-            # We do this by updating them whenever waveform_file_dropdown changes
-            def sync_all_dropdowns(dropdown_update):
-                """When the waveform dropdown is refreshed, sync FFT + spectrogram."""
-                choices = dropdown_update.get("choices", []) if isinstance(dropdown_update, dict) else []
-                value   = choices[0] if choices else None
-                return (gr.Dropdown(choices=choices, value=value),
-                        gr.Dropdown(choices=choices, value=value))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Serialisation failed: {e}"}), 500
 
-            waveform_file_dropdown.change(
-                fn      = sync_all_dropdowns,
-                inputs  = [waveform_file_dropdown],
-                # outputs = [fft_file_dropdown, spec_file_dropdown],
-            )
 
-            # ── Wire: per-file view callbacks ─────────────────
-            waveform_file_dropdown.change(
-                fn=view_waveform, inputs=[waveform_file_dropdown],
-                outputs=[waveform_plot])
+@flask_app.route("/api/multi/waveform")
+def api_waveform():
+    filename = request.args.get("file", "")
+    return jsonify({"image": fig_to_b64(view_waveform(filename))})
 
-            # fft_file_dropdown.change(
-            #     fn=view_fft,
-            #     inputs=[fft_file_dropdown, freq_limit_slider],
-            #     outputs=[fft_plot])
 
-            # freq_limit_slider.change(
-            #     fn=view_fft,
-            #     inputs=[fft_file_dropdown, freq_limit_slider],
-            #     outputs=[fft_plot])
+@flask_app.route("/api/multi/waveform-zoom")
+def api_waveform_zoom():
+    filename = request.args.get("file", "")
+    start    = float(request.args.get("start", 0))
+    end      = float(request.args.get("end", 5))
+    return jsonify({"image": fig_to_b64(view_waveform_zoomed(filename, start, end))})
 
-            # spec_file_dropdown.change(
-            #     fn=view_spectrogram, inputs=[spec_file_dropdown],
-            #     outputs=[spectrogram_plot])
 
-            # ── Wire: bad/good file lists ─────────────────────
-            def update_file_lists(anomaly_df):
-                if anomaly_df is None or len(anomaly_df) == 0:
-                    return "", ""
-                df = _DF_CACHE.get("df")
-                if df is None:
-                    return "", ""
-                bad_files  = df[df["Group"] == "Bad Signals"]["Filename"].tolist()
-                good_files = df[df["Group"] == "Good Signals"]["Filename"].tolist()
-                return "\n".join(bad_files) or "None", "\n".join(good_files) or "None"
+@flask_app.route("/api/multi/fft")
+def api_fft():
+    filename   = request.args.get("file", "")
+    freq_limit = int(request.args.get("freq_limit", 5000))
+    return jsonify({"image": fig_to_b64(view_fft(filename, freq_limit))})
 
-            anomaly_summary_df.change(
-                fn=update_file_lists, inputs=[anomaly_summary_df],
-                outputs=[bad_files_list, good_files_list])
 
-            # NEW — Wire: anomaly metrics from anomaly_df
-            def update_anomaly_metrics(anomaly_df):             # NEW
-                return get_anomaly_metrics(anomaly_df)          # NEW
-
-            anomaly_summary_df.change(                          # NEW
-                fn      = update_anomaly_metrics,               # NEW
-                inputs  = [anomaly_summary_df],                 # NEW
-                outputs = [metric_total, metric_anomalous, metric_rate],  # NEW
-            )
-
-            # NEW — Wire: anomaly detail text (triggered by anomaly_df change)
-            anomaly_summary_df.change(                          # NEW
-                fn      = make_anomaly_detail_text,             # NEW
-                inputs  = [anomaly_summary_df],                 # NEW
-                outputs = [anomaly_detail_text],                # NEW
-            )
-
-            # NEW — Wire: zoom sliders → zoomed waveform
-            zoom_start.change(                                  # NEW
-                fn=view_waveform_zoomed,
-                inputs=[waveform_file_dropdown, zoom_start, zoom_end],
-                outputs=[zoomed_waveform_plot])
-            zoom_end.change(                                    # NEW
-                fn=view_waveform_zoomed,
-                inputs=[waveform_file_dropdown, zoom_start, zoom_end],
-                outputs=[zoomed_waveform_plot])
-            waveform_file_dropdown.change(                      # NEW (also update zoom plot)
-                fn=view_waveform_zoomed,
-                inputs=[waveform_file_dropdown, zoom_start, zoom_end],
-                outputs=[zoomed_waveform_plot])
-
-            # NEW — Wire: folder path load button
-            load_folder_btn.click(                              # NEW
-                fn      = load_files_from_folder,              # NEW
-                inputs  = [folder_path_input],                 # NEW
-                outputs = analyse_outputs,                     # NEW (same outputs as upload)
-            )
-
-            # # ── Wire: CSV download ────────────────────────────
-            # def download_csv():
-            #     df = _DF_CACHE.get("df")
-            #     if df is None:
-            #         return None
-            #     path = "models/audio_statistics.csv"
-            #     df.to_csv(path, index=False)
-            #     return path
-
-            # stats_download_btn.click(
-            #     fn=download_csv, inputs=[], outputs=[gr.File(label="Download CSV")])
-
-        gr.Markdown("---\n*Engine Acoustic Diagnostic AI — EngenX*")
-
-    return app
+@flask_app.route("/api/multi/spectrogram")
+def api_spectrogram():
+    filename = request.args.get("file", "")
+    return jsonify({"image": fig_to_b64(view_spectrogram(filename))})
 
 
 # ════════════════════════════════════════════════════════════
@@ -1393,12 +1195,7 @@ if __name__ == "__main__":
     print("=" * 55)
     print(f"  RF Model   : {'Ready' if check_model_ready()    else 'Not trained yet'}")
     print(f"  Baseline   : {'Ready' if check_baseline_ready() else 'Not built yet'}")
-    print("\n  Opening app at: http://localhost:7860")
+    print("  Opening app at: http://localhost:5000")
+    print("  Serving UI  at: http://localhost:5000/")
     print("=" * 55 + "\n")
-    app = build_ui()
-    app.launch(
-        server_name="0.0.0.0", 
-        server_port = int(os.environ.get("PORT", 7860)), 
-        share=False, 
-        show_error=True,
-    )
+    flask_app.run(host="0.0.0.0", port=5000, debug=False)
