@@ -154,9 +154,6 @@ def sliding_window_analysis(
         if anomaly_score >= threshold:
             status = "ANOMALY"
             label  = "ANOMALY"
-        elif anomaly_score >= threshold * 0.7:   # 70% of threshold = warning zone
-            status = "NORMAL"
-            label  = "WARNING"
         else:
             status = "NORMAL"
             label  = "NORMAL"
@@ -305,8 +302,6 @@ def plot_anomaly_timeline(results, summary, regions, file_path):
     for label in labels:
         if label == "ANOMALY":
             bar_colors.append(BAR_ANOMALY)
-        elif label == "WARNING":
-            bar_colors.append(BAR_WARNING)
         else:
             bar_colors.append(BAR_NORMAL)
 
@@ -383,7 +378,6 @@ def plot_anomaly_timeline(results, summary, regions, file_path):
     # Legend
     legend_patches = [
         mpatches.Patch(color=BAR_NORMAL,  label="Normal"),
-        mpatches.Patch(color=WARN_COLOR,  label="Warning zone"),
         mpatches.Patch(color=BAR_ANOMALY, label="Anomaly (FAIL)"),
         plt.Line2D([0], [0], color=WARN_COLOR, linestyle="--", label=f"Threshold")
     ]

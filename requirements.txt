@@ -3,7 +3,8 @@ numpy
 scikit-learn
 matplotlib
 joblib
-gradio
+flask
+flask-cors
 soundfile
 audioread
 pandas
