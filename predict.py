@@ -195,22 +195,39 @@ def compute_ensemble_status(prob_normal, baseline_risk_level, zscore_vote, file_
     # ── Detector 3: Z-score vote (already computed) ────────────
     zscore_v = zscore_vote   # "PASS" / "WARNING" / "FAIL"
 
-    votes = [rf_vote, baseline_vote, zscore_v]
+    votes    = [rf_vote, baseline_vote, zscore_v]
+    ann_vote = None
     try:
         ann_status, _, _ = ann_predict(file_path)
+        ann_vote = ann_status
         votes.append(ann_status)
-    except:
-        pass
-    fail_count    = votes.count("FAIL")
+    except Exception:
+        pass   # ANN unavailable — use 3-detector ensemble only
 
-    if fail_count >= ENSEMBLE_FAIL_VOTES:          # >= 2 detectors say FAIL
-        final_status = "FAIL"
-        explanation  = (f"[RF={rf_vote}, Baseline={baseline_vote}, "
-                        f"ZScore={zscore_v}] — {fail_count}/3 FAIL votes")
-    else:                                          # most detectors say PASS
+    fail_count  = votes.count("FAIL")
+    total_votes = len(votes)   # 3 without ANN, 4 with ANN
+
+    # Build vote breakdown string (always visible)
+    ann_part = f", ANN={ann_vote}" if ann_vote is not None else ""
+    vote_str = (f"[RF={rf_vote}, Baseline={baseline_vote}, "
+                f"ZScore={zscore_v}{ann_part}]")
+
+    # ── RF PASS VETO ───────────────────────────────────────────
+    # RF is the primary, most-trained detector.
+    # If RF says PASS (prob_normal >= adaptive threshold), the engine
+    # is PASS — no other detector can override this decision.
+    # Ensemble voting only applies when RF itself says FAIL.
+    if rf_vote == "PASS":
         final_status = "PASS"
-        explanation  = (f"[RF={rf_vote}, Baseline={baseline_vote}, "
-                        f"ZScore={zscore_v}] — majority PASS")
+        explanation  = (f"{vote_str} — RF PASS (≥{pass_thr*100:.1f}%), "
+                        f"engine is PASS regardless of other detectors")
+    elif fail_count >= ENSEMBLE_FAIL_VOTES:        # RF=FAIL + ensemble confirms
+        final_status = "FAIL"
+        explanation  = f"{vote_str} — RF FAIL confirmed by ensemble ({fail_count}/{total_votes} FAIL votes)"
+    else:                                          # RF=FAIL but ensemble disagrees
+        final_status = "PASS"
+        explanation  = (f"{vote_str} — RF FAIL but only {fail_count}/{total_votes} "
+                        f"detector(s) agree, majority PASS")
 
     return final_status, explanation
 

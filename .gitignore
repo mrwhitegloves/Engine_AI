@@ -15,16 +15,16 @@ __pycache__/
 *.log
 startup_log.txt
 
-# Models
-models/
-*.h5
-*.pkl
-*.joblib
+# Dataset (only already-tracked files stay in git)
+dataset/
+
+# Runtime uploads
+tmp_uploads/
+
+# Models: models/ is committed on purpose (the server needs them).
+# Only ignore other stray model artifacts outside models/.
 *.pt
 *.pth
-
-# Dataset
-dataset/
 
 # OS files
 .DS_Store

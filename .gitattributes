@@ -3,3 +3,5 @@
 *.mp3 filter=lfs diff=lfs merge=lfs -text
 *.png filter=lfs diff=lfs merge=lfs -text
 *.csv filter=lfs diff=lfs merge=lfs -text
+# Model files are small and needed at runtime on Render: store as normal git blobs, not LFS
+models/** -filter -diff -merge

@@ -35,17 +35,30 @@ N_ESTIMATORS  = 200     # Number of trees in Random Forest
 # SOLUTION SETTINGS  (all lines below are NEW — added to fix false positives)
 # =============================================================================
 
-# ── Task 7: Three-zone Gray Zone decision thresholds ─────────
-# Instead of binary PASS/FAIL we now use three zones:
-#   PASS    — Normal Score >= PASS_THRESHOLD  (engine is healthy)
-#   FAIL    — Normal Score <  WARN_THRESHOLD  (engine has a problem)
+# ── Threshold settings ───────────────────────────────────────
 #
-# IMPORTANT: run_training() auto-calculates an adaptive PASS_THRESHOLD
-# from the actual training data and saves it to models/threshold.pkl.
-# That file takes priority over this hardcoded value.
-# These values are only used as a fallback when threshold.pkl is missing.
-PASS_THRESHOLD  = 0.65   # CHANGED — was 0.90 (too strict for small datasets)
-# WARN_THRESHOLD  = 0.45   # CHANGED — new: bottom of WARNING zone
+# FIXED_PASS_THRESHOLD — Layer 1 of the threshold locking system.
+#
+#   Set this to a float to lock the PASS threshold permanently.
+#   It will NEVER change no matter how many times you retrain.
+#
+#   HOW TO USE:
+#     After your first training run, the terminal prints:
+#       "Computed value : 0.7483  (74.8%)"
+#     Copy that number here:
+#       FIXED_PASS_THRESHOLD = 0.748
+#
+#   Leave it as None to let the lock-file system manage it automatically
+#   (threshold is computed once on first training run, then never changes).
+#
+#   None  = use lock file system (recommended)
+#   float = always use this exact value (maximum control)
+FIXED_PASS_THRESHOLD = None   # e.g. set to 0.748 to hardcode 74.8%
+
+# Three-zone thresholds used as fallback when threshold.pkl is missing.
+# These are overridden by FIXED_PASS_THRESHOLD or the lock file.
+PASS_THRESHOLD  = 0.65   # fallback PASS zone bottom
+# WARN_THRESHOLD  = 0.45   # fallback WARNING zone bottom
 
 # ── Task 4: Frequency Band Filtering ─────────────────────────
 # Engine fundamental frequencies are concentrated in 500–2000 Hz.

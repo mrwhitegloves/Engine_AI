@@ -1,13 +1,47 @@
 # ============================================================
 # train_model.py  —  Train the AI model and save it to disk
 #
-# CHANGES vs previous version (all marked # CHANGED):
-#   Task 1  — compute_adaptive_threshold()  : finds optimal PASS threshold
-#              from the actual training-data normal-class probabilities.
-#              Saves to models/threshold.pkl so predict.py can load it.
-#   Task 3  — save_feature_importances()    : saves RF feature_importances_
-#              to models/feature_importances.pkl for weighted z-score scoring.
-#   run_training()                          : calls both functions above.
+# THRESHOLD LOCKING (latest update):
+#
+#   Problem:  The adaptive threshold (PASS %) was recomputed from
+#             scratch every training run, so it changed whenever
+#             the dataset size changed:
+#               - 21 samples  → 74.8%
+#               - 88 samples  → 85.0%
+#             This caused confusion because the same engine recording
+#             could PASS one day and FAIL the next, just because more
+#             training data was added.
+#
+#   Root cause in the old code:
+#             compute_adaptive_threshold() used np.percentile(normal_probs, 5)
+#             which depends on BOTH the number of samples AND the model's
+#             confidence level — both of which change with every retrain.
+#
+#   Fix:      Three-layer threshold protection:
+#
+#     Layer 1 — FIXED_PASS_THRESHOLD in config.py
+#               A hardcoded value you set once and own.
+#               Set it after your first good training run.
+#               Use:  FIXED_PASS_THRESHOLD = 0.748  (from your 1st run)
+#               When this is set (not None), it ALWAYS wins.
+#
+#     Layer 2 — LOCK FILE  (models/threshold_locked.pkl)
+#               Written once when you first run training.
+#               On subsequent retrains, the locked value is reloaded
+#               instead of recomputed.
+#               Delete this file ONLY when you deliberately want a new
+#               threshold (e.g. after adding a completely new engine type).
+#
+#     Layer 3 — Adaptive fallback
+#               If no lock file and no fixed config value, the old
+#               percentile method runs as before.  This only triggers
+#               on the very first training run.
+#
+#   How to use:
+#     First run   — threshold is computed and lock file is created
+#     Retrains    — lock file is found, same threshold is reused
+#     Reset       — delete models/threshold_locked.pkl, retrain once
+#     Hard-fix    — set FIXED_PASS_THRESHOLD = 0.748 in config.py
 # ============================================================
 
 import os
@@ -26,12 +60,14 @@ from data_preparation import prepare_dataset, create_project_folders
 from config import (
     MODEL_PATH, SCALER_PATH, TEST_SIZE,
     RANDOM_STATE, N_ESTIMATORS,
-    MODEL_DIR                                          # CHANGED — needed for new paths
+    MODEL_DIR,
+    FIXED_PASS_THRESHOLD,     # LOCK — use this to hardcode the threshold in config.py
 )
 
-# CHANGED — paths for new saved artefacts
-THRESHOLD_PATH     = "models/threshold.pkl"           # CHANGED
-IMPORTANCES_PATH   = "models/feature_importances.pkl" # CHANGED
+# Paths for saved artefacts
+THRESHOLD_PATH      = "models/threshold.pkl"
+THRESHOLD_LOCK_PATH = "models/threshold_locked.pkl"   # LOCK — written once, reused on retrains
+IMPORTANCES_PATH    = "models/feature_importances.pkl"
 
 
 # ────────────────────────────────────────────────────────────
@@ -149,72 +185,143 @@ def load_model():
 
 
 # ────────────────────────────────────────────────────────────
-# 6.  ADAPTIVE THRESHOLD  (NEW — Task 1)
+# 6.  THRESHOLD MANAGEMENT  (Three-layer locking system)
 # ────────────────────────────────────────────────────────────
 
-def compute_adaptive_threshold(model, X_train_scaled, y_train):
+def _compute_threshold_from_data(model, X_train_scaled, y_train):
     """
-    CHANGED (Task 1) — Compute the optimal PASS threshold from the
-    actual distribution of normal-class probabilities in the training data.
+    Internal helper — compute the 5th-percentile threshold from training data.
+    This runs ONLY when no lock file and no fixed config value exists.
+    After the first run, the result is locked and this never runs again.
 
-    Problem being solved:
-        With a small dataset the RF model naturally produces lower
-        probabilities.  A hardcoded 90% threshold will reject many truly
-        normal engines because the model only outputs e.g. 65–75% for normals.
-
-    Method — 5th-percentile rule:
-        1. Get prob_normal for every KNOWN-NORMAL training sample.
-        2. Set threshold = 5th percentile of those probabilities.
-        3. This guarantees that 95% of the training normal samples pass,
-           while the other 5% (outliers in the training set) still may not.
-        4. Clamp to [0.40, 0.85] so the threshold is always sensible.
-
-    Returns
-    -------
-    threshold  : float  The adaptive PASS threshold (0–1)
-    mean_prob  : float  Mean normal-class probability (for reporting)
-    std_prob   : float  Std of normal-class probabilities
+    Returns: (threshold, mean_prob, std_prob)
     """
-    # Get prob_normal for all training samples
-    probs = model.predict_proba(X_train_scaled)
-
-    # Keep only the known-normal samples
+    probs        = model.predict_proba(X_train_scaled)
     normal_mask  = (y_train == 0)
-    normal_probs = probs[normal_mask, 0]      # prob_normal for true normals
+    normal_probs = probs[normal_mask, 0]
 
     if len(normal_probs) == 0:
-        return 0.65, 0.65, 0.0               # fallback if no normal samples
+        return 0.65, 0.65, 0.0
 
     mean_prob = float(np.mean(normal_probs))
     std_prob  = float(np.std(normal_probs))
-
-    # 5th percentile — 95 % of training normals will be above this
-    p5 = float(np.percentile(normal_probs, 5))
-
-    # Clamp to a sensible range
+    p5        = float(np.percentile(normal_probs, 5))
     threshold = float(np.clip(p5, 0.40, 0.85))
 
     print(f"\n  Adaptive threshold computed from {int(normal_mask.sum())} normal training samples:")
     print(f"    Mean prob_normal  : {mean_prob:.4f}")
     print(f"    Std  prob_normal  : {std_prob:.4f}")
     print(f"    5th percentile    : {p5:.4f}")
-    print(f"    Clamped threshold : {threshold:.4f}  ({threshold*100:.1f}%)")
+    print(f"    Computed value    : {threshold:.4f}  ({threshold*100:.1f}%)")
     return threshold, mean_prob, std_prob
 
 
-def save_adaptive_threshold(threshold, mean_prob, std_prob):
+def resolve_threshold(model, X_train_scaled, y_train):
     """
-    CHANGED (Task 1) — Persist the adaptive threshold to disk so that
-    predict.py can load it without re-running training.
+    Three-layer threshold resolution.  Checks layers in order and
+    stops at the first layer that provides a value.
+
+    LAYER 1 — config.py hardcoded value (FIXED_PASS_THRESHOLD)
+    ───────────────────────────────────────────────────────────
+    If FIXED_PASS_THRESHOLD is set to a float in config.py, it wins
+    unconditionally.  No file is read, no computation is done.
+    Use this when you want 100% control:
+        FIXED_PASS_THRESHOLD = 0.748   # in config.py
+
+    LAYER 2 — lock file (models/threshold_locked.pkl)
+    ──────────────────────────────────────────────────
+    Written after the FIRST training run.  Every subsequent retrain
+    reads this file and reuses the same value.
+    To reset: delete models/threshold_locked.pkl and retrain once.
+
+    LAYER 3 — compute from data (first run only)
+    ─────────────────────────────────────────────
+    Runs only when neither Layer 1 nor Layer 2 applies.
+    Computes the 5th-percentile of normal-class probabilities.
+    Immediately writes the lock file so Layer 2 takes over next time.
+
+    Returns: (threshold, mean_prob, std_prob, source_label)
+    """
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    # ── Layer 1: fixed config value ───────────────────────────
+    if FIXED_PASS_THRESHOLD is not None:
+        threshold = float(FIXED_PASS_THRESHOLD)
+        print(f"\n  Threshold — Layer 1 (config.py fixed value):")
+        print(f"    FIXED_PASS_THRESHOLD = {threshold:.4f}  ({threshold*100:.1f}%)")
+        print(f"    This value is always used regardless of training data.")
+        return threshold, threshold, 0.0, "config_fixed"
+
+    # ── Layer 2: lock file ────────────────────────────────────
+    if os.path.exists(THRESHOLD_LOCK_PATH):
+        locked = joblib.load(THRESHOLD_LOCK_PATH)
+        threshold = float(locked["threshold"])
+        print(f"\n  Threshold — Layer 2 (lock file reused from first training run):")
+        print(f"    Locked value      : {threshold:.4f}  ({threshold*100:.1f}%)")
+        print(f"    Locked on         : {locked.get('locked_on', 'unknown date')}")
+        print(f"    Lock file         : {THRESHOLD_LOCK_PATH}")
+        print(f"    To reset          : delete {THRESHOLD_LOCK_PATH} and retrain")
+        return threshold, locked.get("mean_prob", threshold), locked.get("std_prob", 0.0), "lock_file"
+
+    # ── Layer 3: compute from data (first run) ────────────────
+    print(f"\n  Threshold — Layer 3 (first run — computing from training data):")
+    print(f"    No lock file found at {THRESHOLD_LOCK_PATH}")
+    print(f"    Computing threshold and writing lock file ...")
+    threshold, mean_prob, std_prob = _compute_threshold_from_data(
+        model, X_train_scaled, y_train
+    )
+    # Write the lock file immediately so every future retrain reuses this value
+    from datetime import datetime
+    lock_data = {
+        "threshold"  : threshold,
+        "mean_prob"  : mean_prob,
+        "std_prob"   : std_prob,
+        "locked_on"  : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "locked_from": "first_training_run",
+    }
+    joblib.dump(lock_data, THRESHOLD_LOCK_PATH)
+    print(f"    Lock file written : {THRESHOLD_LOCK_PATH}")
+    print(f"    This value will be reused on ALL future retrains.")
+    print(f"    To reset          : delete {THRESHOLD_LOCK_PATH} and retrain")
+    return threshold, mean_prob, std_prob, "computed_and_locked"
+
+
+def save_threshold(threshold, mean_prob, std_prob, source_label):
+    """
+    Save the FINAL resolved threshold to models/threshold.pkl.
+    This is what predict.py reads at inference time.
+    The value written here is always the one from resolve_threshold()
+    — so it is always stable after the first training run.
     """
     os.makedirs(MODEL_DIR, exist_ok=True)
     data = {
         "threshold" : threshold,
         "mean_prob" : mean_prob,
         "std_prob"  : std_prob,
+        "source"    : source_label,
     }
     joblib.dump(data, THRESHOLD_PATH)
-    print(f"  Threshold saved -> {THRESHOLD_PATH}  (value: {threshold:.4f})")
+    print(f"  Threshold saved   : {THRESHOLD_PATH}  "
+          f"(value: {threshold:.4f} = {threshold*100:.1f}%,  source: {source_label})")
+
+
+def reset_threshold_lock():
+    """
+    Utility — call this when you WANT the threshold to be recomputed
+    on the next training run (e.g. after adding a new engine type or
+    changing recording conditions).
+
+    Usage:
+        from train_model import reset_threshold_lock
+        reset_threshold_lock()
+        run_training()   # threshold will be recomputed and a new lock written
+    """
+    if os.path.exists(THRESHOLD_LOCK_PATH):
+        os.remove(THRESHOLD_LOCK_PATH)
+        print(f"  Lock file deleted: {THRESHOLD_LOCK_PATH}")
+        print(f"  Next training run will recompute the threshold from data.")
+    else:
+        print(f"  No lock file found at {THRESHOLD_LOCK_PATH} — nothing to reset.")
 
 
 # ────────────────────────────────────────────────────────────
@@ -290,11 +397,14 @@ def run_training(algorithm="random_forest"):
     # Step 6 — Save model + scaler
     save_model(model, scaler)
 
-    # CHANGED Step 7 — Compute and save adaptive threshold (Task 1)
-    threshold, mean_prob, std_prob = compute_adaptive_threshold(
+    # LOCK Step 7 — Resolve threshold using 3-layer locking system
+    # Layer 1: config.py FIXED_PASS_THRESHOLD  (if set, always wins)
+    # Layer 2: models/threshold_locked.pkl      (reuse from first run)
+    # Layer 3: compute from data                (first run only, then locks)
+    threshold, mean_prob, std_prob, source = resolve_threshold(
         model, X_train_scaled, y_train
     )
-    save_adaptive_threshold(threshold, mean_prob, std_prob)
+    save_threshold(threshold, mean_prob, std_prob, source)
 
     # CHANGED Step 8 — Save feature importances (Task 3)
     save_feature_importances(model)

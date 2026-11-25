@@ -116,7 +116,7 @@ def analyze_engine_audio(audio_file):
 
     try:
         final_status, ensemble_explanation = compute_ensemble_status(
-            prob_normal, risk_level, zscore_vote)
+            prob_normal, risk_level, zscore_vote, audio_file)
     except Exception:
         final_status         = status
         ensemble_explanation = "(ensemble error, using RF only)"
