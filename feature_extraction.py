@@ -107,7 +107,7 @@ def smooth_features(features, window=SMOOTHING_WIN):
 # ────────────────────────────────────────────────────────────
 # 1.  LOAD AUDIO
 # ────────────────────────────────────────────────────────────
-def load_audio(file_path):
+def _load_audio_uncached(file_path):
     """
     Load an audio file, resample to SAMPLE_RATE, convert to mono,
     and apply normalization.
@@ -192,7 +192,7 @@ def extract_mel_spectrogram_features(audio, sr):
 # ────────────────────────────────────────────────────────────
 # 3.  COMBINED FEATURE VECTOR (used by training & prediction)
 # ────────────────────────────────────────────────────────────
-def extract_features(file_path):
+def _extract_features_uncached(file_path):
     """
     Master function: load audio -> bandpass filter -> extract ALL features
     -> return one flat feature vector of shape (226,).
@@ -251,3 +251,59 @@ def get_mel_spectrogram_data(audio, sr):
     )
     mel_db = librosa.power_to_db(mel, ref=np.max)
     return mel_db
+
+
+# ────────────────────────────────────────────────────────────
+# PER-FILE CACHE
+# One diagnosis request calls load_audio()/extract_features() on the same
+# file several times (RF, z-score, ensemble, plots, segments). Decoding +
+# resampling + feature extraction is slow on small servers, so compute once
+# per file and hand out copies (callers can never mutate the cached array).
+# Keyed by path + size + mtime, so a changed file is always recomputed.
+# ────────────────────────────────────────────────────────────
+import os as _os
+from collections import OrderedDict as _OrderedDict
+
+_CACHE_MAX = 8
+_audio_cache = _OrderedDict()
+_feature_cache = _OrderedDict()
+
+
+def _cache_key(file_path):
+    st = _os.stat(file_path)
+    return (_os.path.abspath(str(file_path)), st.st_size, st.st_mtime_ns)
+
+
+def _cache_get(cache, key):
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    return None
+
+
+def _cache_put(cache, key, value):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _CACHE_MAX:
+        cache.popitem(last=False)
+
+
+def load_audio(file_path):
+    """Cached wrapper around _load_audio_uncached (returns a copy)."""
+    key = _cache_key(file_path)
+    hit = _cache_get(_audio_cache, key)
+    if hit is None:
+        hit = _load_audio_uncached(file_path)
+        _cache_put(_audio_cache, key, hit)
+    audio, sr = hit
+    return audio.copy(), sr
+
+
+def extract_features(file_path):
+    """Cached wrapper around _extract_features_uncached (returns a copy)."""
+    key = _cache_key(file_path)
+    hit = _cache_get(_feature_cache, key)
+    if hit is None:
+        hit = _extract_features_uncached(file_path)
+        _cache_put(_feature_cache, key, hit)
+    return hit.copy()

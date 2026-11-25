@@ -5,7 +5,7 @@ services:
     plan: free
     branch: main
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: gunicorn app:flask_app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 180
+    startCommand: gunicorn app:flask_app --bind 0.0.0.0:$PORT --workers 1 --threads 1 --timeout 300
     healthCheckPath: /api/status
     autoDeploy: true
     envVars:
@@ -15,3 +15,9 @@ services:
         value: "2"
       - key: MPLBACKEND
         value: Agg
+      - key: NUMBA_CACHE_DIR
+        value: /tmp/numba_cache
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"

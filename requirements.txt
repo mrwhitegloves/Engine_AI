@@ -11,4 +11,7 @@ matplotlib==3.10.8
 seaborn==0.13.2
 soundfile==0.13.1
 audioread==3.1.0
-tensorflow-cpu==2.21.0
+# tensorflow-cpu is intentionally NOT installed on Render: it needs ~400MB RAM
+# (free plan has 512MB) and crashed /api/diagnose with 502. ann_model.py falls
+# back automatically, same as the local setup where TF is not loading either.
+# To re-enable the ANN on a bigger plan, add: tensorflow-cpu==2.21.0
